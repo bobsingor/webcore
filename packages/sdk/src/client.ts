@@ -65,6 +65,31 @@ export interface RuntimeProcess {
   kill(signal?: number): void
 }
 
+export interface TerminalOptions {
+  /** Default: a login shell, ['sh', '-l']. */
+  command?: string[]
+  cols?: number
+  rows?: number
+  cwd?: string
+  /** Added to the default environment, which sets TERM=xterm-256color and COLORTERM=truecolor. */
+  env?: Record<string, string>
+  /** What the terminal shows: bytes for a terminal emulator such as xterm.js. */
+  onData(chunk: Uint8Array): void
+}
+
+/** A program on a pseudo-terminal (M2a), such as a shell, for a terminal emulator to drive. */
+export interface RuntimeTerminal {
+  readonly pid: number
+  /** The program's exit status. */
+  readonly exited: Promise<number>
+  /** Keystrokes: what the user types, including control characters (^C is "\x03"). */
+  write(data: string | Uint8Array): void
+  /** The terminal's new size; the foreground job gets SIGWINCH. */
+  resize(cols: number, rows: number): void
+  /** Hangs up, as closing a terminal window does: the session gets SIGHUP. */
+  close(): void
+}
+
 export interface ShellSession {
   readonly cwd: string
   readonly env: Readonly<Record<string, string>>
@@ -193,6 +218,38 @@ export class Runtime {
     proc.end()
     const code = await proc.exited
     return { code, stdout: stdout + decoders.out.decode(), stderr: stderr + decoders.err.decode() }
+  }
+
+  /** Starts a program, a login shell by default, on a new terminal. */
+  async openTerminal(options: TerminalOptions): Promise<RuntimeTerminal> {
+    const job = this.#nextJob++
+    let resolveExit!: (code: number) => void
+    const exited = new Promise<number>((resolve) => (resolveExit = resolve))
+    this.#jobs.set(job, {
+      onOutput: (_fd, data) => options.onData(data),
+      onExit: (code) => {
+        this.#jobs.delete(job)
+        resolveExit(code)
+      },
+    })
+    let pid: number
+    try {
+      ;({ pid } = await this.#call('terminal.open', [
+        job,
+        options.command ?? ['sh', '-l'],
+        { cols: options.cols ?? 80, rows: options.rows ?? 24, cwd: options.cwd, env: options.env },
+      ]))
+    } catch (error) {
+      this.#jobs.delete(job)
+      throw error
+    }
+    return {
+      pid,
+      exited,
+      write: (data) => this.#post({ t: 'stdin', job, data: typeof data === 'string' ? encoder.encode(data) : data }),
+      resize: (cols, rows) => this.#post({ t: 'resize', job, cols, rows }),
+      close: () => this.#post({ t: 'stdin', job, data: null }),
+    }
   }
 
   /** A shell session: its working directory and exported variables carry over between lines. */

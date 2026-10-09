@@ -8,6 +8,7 @@ import type { SyscallClient } from '../../process/syscalls.ts'
 import { createBindings, type BindingFactory } from './bindings/index.ts'
 import type { Streams } from './bindings/streams.ts'
 import { selectMainScript, type CommandLine } from './cli.ts'
+import { isTerminal } from './bindings/streams.ts'
 import { compileFunction, compiledScripts } from './compile.ts'
 import { kEvaluationPhase, type Acorn } from './esm/transform.ts'
 import type { NodeLib } from './lib.ts'
@@ -128,6 +129,8 @@ export class Realm {
 
   /** Process-wide worker_threads ids, shared by every thread (Atomics.add). */
   readonly threadIdCounter: Int32Array
+  /** Run when the process exits, before the kernel tears it down (libuv's uv_tty_reset_mode). */
+  readonly atExit = new Set<() => void>()
 
   private readonly factories: Record<string, BindingFactory>
   private readonly bindingCache = new Map<string, object>()
@@ -257,7 +260,7 @@ export class Realm {
   /** StartExecution: runs one internal/main/* script inside a callback scope. */
   runMain(): void {
     // A worker_threads thread waits for its script on the env port (internal/main/worker_thread).
-    const id = this.boot.thread ? 'internal/main/worker_thread' : selectMainScript(this.commandLine)
+    const id = this.boot.thread ? 'internal/main/worker_thread' : selectMainScript(this.commandLine, () => isTerminal(this, 0))
     this.loop.callback(() => this.compile(id)(this.process, this.requireBuiltin, this.internalBinding, this.primordials))
     this.loop.queueAliveCheck()
   }

@@ -11,6 +11,27 @@ import {
   O_TRUNC,
 } from '../abi/constants.ts'
 import { completeSync, createPage, DEFAULT_PAGE_BYTES, pageCapacity } from '../abi/page.ts'
+import {
+  defaultTerminates,
+  FIONREAD,
+  isValidSignal,
+  SIGHUP,
+  SIGKILL,
+  TCGETS,
+  TCSETS,
+  TCSETSF,
+  TCSETSW,
+  TIOCGPGRP,
+  TIOCGSID,
+  TIOCGWINSZ,
+  TIOCSCTTY,
+  TIOCSPGRP,
+  TIOCSWINSZ,
+  type SignalAction,
+  type SignalMessage,
+  type Termios,
+  type WinSize,
+} from '../abi/signals.ts'
 import type { BootMessage, SyscallReply, SyscallRequest } from '../abi/protocol.ts'
 import { SPAWN_SYNC_HEADER_BYTES } from '../abi/syscalls.ts'
 import type { SocketInfo, SpawnSyncRequest, SyscallArgs, SyscallName, SyscallReturn, SyscallValue } from '../abi/syscalls.ts'
@@ -22,6 +43,7 @@ import { resolveExecutable, type Executable } from './exec.ts'
 import { DeviceHandle, DirHandle, FileHandle, PipeReader, PipeWriter, type OpenFile } from './files.ts'
 import { dirname, normalize, resolve } from './path.ts'
 import { Pipe } from './pipe.ts'
+import { Pty, PtyMaster, PtySlave, ptyOf } from './pty.ts'
 import { Process, type Channel, type Thread, type WorkerLike } from './process.ts'
 import { MemFS, type FileNode } from './vfs.ts'
 
@@ -47,6 +69,13 @@ export interface SpawnOptions {
   ppid?: number
   /** Process group to join. By default a process leads a new group of its own. */
   pgid?: number
+  /** Session to join. By default a process leads a new session of its own. */
+  sid?: number
+  /**
+   * A terminal (a PTY slave) that becomes the controlling terminal of the process's new session,
+   * with the process's group in the foreground: what a terminal emulator does for its shell.
+   */
+  terminal?: OpenFile
 }
 
 type Handler<N extends SyscallName> = (
@@ -75,7 +104,9 @@ export class Kernel {
   private readonly modules = new WeakMap<FileNode, { version: number; module: Promise<WebAssembly.Module> }>()
   private readonly assets: Record<string, Uint8Array> = {}
   private readonly watchers = new Set<Watcher>()
+  private readonly ptys = new Set<Pty>()
   private nextPid = 1
+  private nextPty = 0
 
   constructor(options: KernelOptions) {
     this.host = options.host
@@ -117,7 +148,13 @@ export class Kernel {
     const cwd = normalize(options.cwd ?? '/')
     if (this.fs.lookup(cwd).kind !== 'dir') throw kerr('ENOTDIR', cwd)
     const exe = resolveExecutable(this.fs, argv, cwd, env.PATH ?? DEFAULT_PATH)
-    const proc = new Process({ pid: this.nextPid++, ppid: options.ppid ?? 0, pgid: options.pgid, argv: exe.argv, env, cwd })
+    const pid = this.nextPid++
+    const proc = new Process({ pid, ppid: options.ppid ?? 0, pgid: options.pgid, sid: options.sid, argv: exe.argv, env, cwd })
+    const terminal = options.terminal && ptyOf(options.terminal)
+    if (terminal && proc.sid === pid && !this.sessionAlive(terminal.session)) {
+      terminal.session = proc.sid
+      terminal.foreground = proc.pgid
+    }
     for (let fd = 0; fd < 3; fd++) {
       proc.fds[fd] = options.stdio?.[fd]?.retain() ?? new DeviceHandle('null', O_RDWR)
     }
@@ -125,6 +162,26 @@ export class Kernel {
     this.events.emit({ type: 'process.spawn', pid: proc.pid, ppid: proc.ppid, argv: proc.argv, cwd })
     void this.boot(proc, exe)
     return proc
+  }
+
+  /**
+   * Creates a pseudo-terminal (M2a). The caller owns one reference to each end: the master is the
+   * terminal emulator's, the slave becomes a program's stdin, stdout and stderr.
+   */
+  openpty(size: WinSize = { rows: 24, cols: 80 }): { master: PtyMaster; slave: PtySlave } {
+    const pty = new Pty(this.nextPty++, size, {
+      signalGroup: (pgid, signal) => this.killGroup(pgid, signal),
+      hangup: (closed) => {
+        // The terminal went away: its session's leader and foreground job hang up.
+        const session = closed.session
+        if (session === undefined) return
+        if (closed.foreground !== undefined) this.killGroup(closed.foreground, SIGHUP)
+        const leader = this.procs.get(session)
+        if (leader?.alive) this.deliver(leader, SIGHUP)
+      },
+    })
+    this.ptys.add(pty)
+    return { master: new PtyMaster(pty), slave: new PtySlave(pty) }
   }
 
   /** Creates a pipe. The caller owns one reference to each end. */
@@ -224,16 +281,19 @@ export class Kernel {
     return [...this.procs.values()]
   }
 
-  /** Terminates a process as if by `signal` (SIGKILL by default): exit status 128 + signal. */
-  kill(pid: number, signal = 9): void {
+  /**
+   * Sends `signal` (SIGKILL by default). The process's disposition decides: its default action
+   * (most signals terminate with status 128 + signal), nothing, or its handler.
+   */
+  kill(pid: number, signal = SIGKILL): void {
     const proc = this.procs.get(pid)
-    if (proc) this.terminate(proc, 128 + signal, signal)
+    if (proc) this.deliver(proc, signal)
   }
 
   /** Signals every live process in a group, as a terminal does for Ctrl+C. */
-  killGroup(pgid: number, signal = 9): void {
+  killGroup(pgid: number, signal = SIGKILL): void {
     for (const proc of [...this.procs.values()]) {
-      if (proc.pgid === pgid && proc.alive) this.terminate(proc, 128 + signal, signal)
+      if (proc.pgid === pgid && proc.alive) this.deliver(proc, signal)
     }
   }
 
@@ -337,6 +397,50 @@ export class Kernel {
   }
 
   /** The process died outside its own control (bad module, Worker error). */
+  /** Terminal requests (M2a), with Linux's rules for sessions and foreground groups. */
+  private ioctl(proc: Process, file: OpenFile, request: number, arg: unknown): unknown {
+    const pty = ptyOf(file)
+    if (!pty) throw kerr('ENOTTY')
+    switch (request) {
+      case TCGETS:
+        return { ...pty.termios, cc: [...pty.termios.cc] }
+      case TCSETS:
+      case TCSETSW:
+      case TCSETSF:
+        pty.setTermios(arg as Termios, request === TCSETSF)
+        return 0
+      case TIOCGWINSZ:
+        return { ...pty.winsize }
+      case TIOCSWINSZ:
+        pty.resize(arg as WinSize)
+        return 0
+      case FIONREAD:
+        return pty.available
+      case TIOCSCTTY:
+        // A session leader without a terminal makes this one its controlling terminal.
+        if (proc.sid !== proc.pid) throw kerr('EPERM')
+        if (pty.session !== proc.sid && this.sessionAlive(pty.session)) throw kerr('EPERM')
+        pty.session = proc.sid
+        pty.foreground = proc.pgid
+        return 0
+      case TIOCGPGRP:
+        if (pty.session !== proc.sid) throw kerr('ENOTTY')
+        return pty.foreground ?? 0
+      case TIOCSPGRP: {
+        if (pty.session !== proc.sid) throw kerr('ENOTTY')
+        const pgid = Number(arg)
+        if (!this.processes.some((member) => member.pgid === pgid && member.sid === proc.sid && member.alive)) throw kerr('EPERM')
+        pty.foreground = pgid
+        return 0
+      }
+      case TIOCGSID:
+        if (pty.session === undefined) throw kerr('ENOTTY')
+        return pty.session
+      default:
+        throw kerr('EINVAL')
+    }
+  }
+
   private crash(proc: Process, error: unknown): void {
     if (proc.state === 'exited') return
     const message = error instanceof Error ? error.message : String(error)
@@ -347,6 +451,23 @@ export class Kernel {
       // stderr is gone; nothing left to report to.
     }
     this.terminate(proc, 1)
+  }
+
+  /** Signal delivery: the default action, nothing, or a message to the process's handler. */
+  private deliver(proc: Process, signal: number): void {
+    if (!proc.alive || !isValidSignal(signal)) return
+    const action = signal === SIGKILL ? undefined : proc.dispositions.get(signal)
+    if (action === 'ignore') return
+    if (action === 'handle' && proc.port) {
+      proc.port.postMessage({ t: 'sig', signal } satisfies SignalMessage)
+      return
+    }
+    if (defaultTerminates(signal)) this.terminate(proc, 128 + signal, signal)
+  }
+
+  /** Whether any live process belongs to session `sid`. */
+  private sessionAlive(sid: number | undefined): boolean {
+    return sid !== undefined && this.processes.some((proc) => proc.sid === sid && proc.alive)
   }
 
   private terminate(proc: Process, code: number, signal: number | null = null): void {
@@ -362,6 +483,17 @@ export class Kernel {
     }
     for (const thread of [...proc.threads.values()]) this.endThread(proc, thread, code)
     this.events.emit({ type: 'process.exit', pid: proc.pid, code: proc.exitCode! })
+
+    // A session leader's exit takes its controlling terminal away; the foreground job hangs up.
+    for (const pty of [...this.ptys]) {
+      if (!pty.open) this.ptys.delete(pty)
+      else if (pty.session === proc.sid && proc.sid === proc.pid) {
+        const foreground = pty.foreground
+        pty.session = undefined
+        pty.foreground = undefined
+        if (foreground !== undefined && foreground !== proc.pgid) this.killGroup(foreground, SIGHUP)
+      }
+    }
 
     // Host-spawned processes and orphans are reaped now; children stay zombies until their parent
     // waits, and a dying parent reaps its zombies.
@@ -418,7 +550,10 @@ export class Kernel {
 
     read: (proc, fd, length) => {
       const max = Math.max(0, Math.min(length | 0, pageCapacity(proc.page!)))
-      return proc.getFd(fd).read(max, proc.abort.signal)
+      const file = proc.getFd(fd)
+      // Terminal reads depend on who reads: only the foreground group gets input.
+      if (file instanceof PtySlave) return file.pty.read(max, proc.abort.signal, proc)
+      return file.read(max, proc.abort.signal)
     },
 
     write: (proc, fd, data) => {
@@ -508,9 +643,18 @@ export class Kernel {
       const fds = request.fds ?? [0, 1, 2]
       const stdio = [0, 1, 2].map((i) => (fds[i] >= 0 ? proc.getFd(fds[i]) : undefined))
       const cwd = request.cwd === undefined ? proc.cwd : this.resolveAt(proc, AT_FDCWD, request.cwd)
-      // Children join their parent's group unless detached (setsid).
-      const pgid = request.detached ? undefined : proc.pgid
-      return this.spawn(argv, { cwd, env: request.env ?? proc.env, stdio, ppid: proc.pid, pgid }).pid
+      const env = request.env ?? proc.env
+      // Detached children start a session of their own (setsid). Others stay in the caller's
+      // session, in its group, a new group (pgid 0), or a given group of the same session.
+      if (request.detached) return this.spawn(argv, { cwd, env, stdio, ppid: proc.pid }).pid
+      let pgid: number | undefined = proc.pgid
+      if (request.pgid !== undefined) {
+        pgid = request.pgid === 0 ? undefined : request.pgid
+        // A group of another session is off limits. One whose members have all exited may be
+        // rejoined: a pipeline's first stage can end before the last one starts.
+        if (pgid !== undefined && this.processes.some((member) => member.pgid === pgid && member.sid !== proc.sid)) throw kerr('EPERM')
+      }
+      return this.spawn(argv, { cwd, env, stdio, ppid: proc.pid, pgid, sid: proc.sid }).pid
     },
 
     kill: (proc, pid, signal) => {
@@ -524,8 +668,47 @@ export class Kernel {
       }
       const target = this.procs.get(pid)
       if (!target || !target.alive) throw kerr('ESRCH')
-      if (signal !== 0) this.terminate(target, 128 + (signal | 0), signal | 0)
+      if (signal !== 0) this.deliver(target, signal | 0)
       return 0
+    },
+
+    sigaction: (proc, signal, action) => {
+      if (!isValidSignal(signal) || signal === SIGKILL || signal === 19 /* SIGSTOP */) throw kerr('EINVAL')
+      if (action !== 'default' && action !== 'ignore' && action !== 'handle') throw kerr('EINVAL')
+      const previous: SignalAction = proc.dispositions.get(signal) ?? 'default'
+      if (action === 'default') proc.dispositions.delete(signal)
+      else proc.dispositions.set(signal, action)
+      return previous
+    },
+
+    setsid: (proc) => {
+      if (this.processes.some((member) => member.pgid === proc.pid && member.alive)) throw kerr('EPERM')
+      proc.sid = proc.pid
+      proc.pgid = proc.pid
+      return proc.pid
+    },
+
+    getsid: (proc, pid) => {
+      const target = pid === 0 ? proc : this.procs.get(pid)
+      if (!target) throw kerr('ESRCH')
+      return target.sid
+    },
+
+    setpgid: (proc, pid, pgid) => {
+      const target = pid === 0 ? proc : this.procs.get(pid)
+      if (!target || (target !== proc && target.ppid !== proc.pid)) throw kerr('ESRCH')
+      if (target.sid !== proc.sid || target.pid === target.sid) throw kerr('EPERM')
+      const group = pgid === 0 ? target.pid : pgid
+      if (group !== target.pid && !this.processes.some((member) => member.pgid === group && member.sid === proc.sid)) throw kerr('EPERM')
+      target.pgid = group
+      return 0
+    },
+
+    ioctl: (proc, fd, request, arg) => this.ioctl(proc, proc.getFd(fd), request, arg),
+
+    openpty: (proc, size) => {
+      const { master, slave } = this.openpty(size && { rows: size.rows | 0, cols: size.cols | 0 })
+      return [proc.allocFd(master), proc.allocFd(slave)]
     },
 
     waitStatus: async (proc, pid) => {
@@ -632,7 +815,7 @@ export class Kernel {
           total += chunk.length
           if (total > maxBuffer) {
             overflow = true
-            if (child) this.terminate(child, 128 + (request.killSignal ?? 15), request.killSignal ?? 15)
+            if (child) this.deliver(child, request.killSignal ?? 15)
             break
           }
           chunks.push(chunk)
@@ -662,7 +845,7 @@ export class Kernel {
 
     const timer =
       request.timeout && request.timeout > 0
-        ? setTimeout(() => this.terminate(child!, 128 + (request.killSignal ?? 15), request.killSignal ?? 15), request.timeout)
+        ? setTimeout(() => this.deliver(child!, request.killSignal ?? 15), request.timeout)
         : undefined
     const code = await child.exited
     if (timer !== undefined) clearTimeout(timer)

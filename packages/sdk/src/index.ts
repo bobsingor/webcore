@@ -13,8 +13,10 @@ export type {
   RuntimeEvents,
   RuntimeFs,
   RuntimeProcess,
+  RuntimeTerminal,
   ShellSession,
   SpawnOptions,
+  TerminalOptions,
 } from './client.ts'
 export type { DirEntry, FileStat, FileType, FsOp, RuntimeEvent, RuntimeInfo, ShellState } from './protocol.ts'
 

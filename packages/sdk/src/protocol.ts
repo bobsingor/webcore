@@ -56,6 +56,11 @@ export interface SpawnRequestOptions {
   env?: Record<string, string>
 }
 
+export interface TerminalRequestOptions extends SpawnRequestOptions {
+  cols: number
+  rows: number
+}
+
 /** Methods and their arguments and results. */
 export interface Methods {
   'fs.readFile': [[path: string], Uint8Array]
@@ -67,6 +72,11 @@ export interface Methods {
   'fs.rename': [[from: string, to: string], void]
   /** Starts argv as job `job`; its output and exit follow as messages. */
   spawn: [[job: number, argv: string[], options: SpawnRequestOptions], { pid: number }]
+  /**
+   * Starts argv on a new pseudo-terminal as job `job`, leading a session with the terminal as its
+   * controlling terminal. Output (fd 1) is what the terminal shows; stdin messages are keystrokes.
+   */
+  'terminal.open': [[job: number, argv: string[], options: TerminalRequestOptions], { pid: number }]
   'shell.create': [[init: Partial<ShellState>], { session: number } & ShellState]
   /** Runs a line in a session as job `job`; resolves when it's done. */
   'shell.run': [[job: number, session: number, line: string], { code: number } & ShellState]
@@ -78,8 +88,10 @@ export type Method = keyof Methods
 
 export type HostMessage =
   | { [M in Method]: { t: 'call'; id: number; method: M; args: Methods[M][0] } }[Method]
-  /** Data for a spawned job's stdin; null closes it. */
+  /** Data for a spawned job's stdin, or keystrokes for a terminal; null closes it (a terminal hangs up). */
   | { t: 'stdin'; job: number; data: Uint8Array | null }
+  /** A terminal's new size: the foreground job gets SIGWINCH. */
+  | { t: 'resize'; job: number; cols: number; rows: number }
   /** Signals a job: its process, or with `group`, every process it started (Ctrl+C). */
   | { t: 'signal'; job: number; signal: number; group: boolean }
   /** A preview page's channel to the bridge, relayed by the SDK; the port is transferred. */

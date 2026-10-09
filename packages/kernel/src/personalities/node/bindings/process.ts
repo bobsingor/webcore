@@ -5,6 +5,7 @@ import { UV_ERRORS } from '../data/uv-errors.ts'
 import type { Realm } from '../realm.ts'
 import { uvCode, uvException, uvMessage, uvName } from '../uv.ts'
 import { host } from '../host.ts'
+import { streamsOf } from './streams.ts'
 
 // The provider list of AsyncWrap (src/async_wrap.h), in order.
 const PROVIDERS = [
@@ -266,24 +267,50 @@ export function processBindings() {
 
     constants: () => CONSTANTS,
 
-    signal_wrap: () => ({
-      // Signals cannot be delivered to a Worker yet; handlers are registered but never fire.
-      Signal: class Signal {
-        start() {
+    signal_wrap: (realm: Realm) => {
+      // Signals the process handles arrive over its message port (sigaction 'handle'). While any
+      // handle listens for a signal, the kernel delivers it instead of taking the default action.
+      const { sys, loop } = realm
+      const { HandleWrap } = streamsOf(realm)
+      const listening = new Map<number, Set<Signal>>()
+      sys.onSignal = (signum) => {
+        for (const handle of [...(listening.get(signum) ?? [])]) loop.callback(() => handle.onsignal?.call(handle, signum))
+      }
+
+      class Signal extends HandleWrap {
+        onsignal?: (signum: number) => void
+        #signum = 0
+
+        start(signum: number): number {
+          if (this.#signum) this.stop()
+          let handles = listening.get(signum)
+          if (!handles?.size) {
+            try {
+              sys.call('sigaction', signum, 'handle')
+            } catch (error) {
+              return uvCode(error)
+            }
+          }
+          if (!handles) listening.set(signum, (handles = new Set()))
+          handles.add(this)
+          this.#signum = signum
+          this.setActive(true)
           return 0
         }
-        close(callback?: () => void) {
-          callback?.()
+
+        stop(): number {
+          const handles = listening.get(this.#signum)
+          if (handles?.delete(this) && !handles.size) sys.call('sigaction', this.#signum, 'default')
+          this.#signum = 0
+          this.setActive(false)
+          return 0
         }
-        ref() {}
-        unref() {}
-        hasRef() {
-          return false
+
+        protected override onClose(): void {
+          this.stop()
         }
-        getAsyncId() {
-          return -1
-        }
-      },
-    }),
+      }
+      return { Signal }
+    },
   }
 }

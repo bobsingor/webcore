@@ -11,6 +11,7 @@ import {
   type KernelEvent,
   type OpenFile,
   type Process,
+  type PtyMaster,
   type Shell,
 } from '@webcore/kernel'
 import {
@@ -24,6 +25,7 @@ import {
   type RuntimeEvent,
   type RuntimeMessage,
   type SpawnRequestOptions,
+  type TerminalRequestOptions,
 } from '@webcore/sdk/protocol'
 
 export interface ServeOptions {
@@ -40,6 +42,8 @@ interface Job {
   writing: Promise<unknown>
   /** A shell line: aborting interrupts it. */
   abort?: AbortController
+  /** A terminal's master end: keystrokes go in, the screen comes out. */
+  terminal?: PtyMaster
 }
 
 const HOME = DEFAULT_ENV.HOME
@@ -84,6 +88,7 @@ export function serveRuntime(kernel: Kernel, port: PortLike, options: ServeOptio
     'fs.rename': (from, to) => kernel.rename(absolute(from), absolute(to)),
 
     spawn: (job, argv, request) => spawn(job, argv, request),
+    'terminal.open': (job, argv, request) => openTerminal(job, argv, request),
 
     'shell.create': (init) => {
       const cwd = init.cwd ?? HOME
@@ -140,6 +145,41 @@ export function serveRuntime(kernel: Kernel, port: PortLike, options: ServeOptio
     return { pid: proc.pid }
   }
 
+  function openTerminal(job: number, argv: string[], request: TerminalRequestOptions): { pid: number } {
+    const cwd = request.cwd ?? HOME
+    const env = { ...DEFAULT_ENV, PWD: cwd, TERM: 'xterm-256color', COLORTERM: 'truecolor', ...request.env }
+    const { master, slave } = kernel.openpty({ cols: request.cols, rows: request.rows })
+    let proc: Process
+    try {
+      // The program leads a new session, with this terminal as its controlling terminal.
+      proc = kernel.spawn(argv, { cwd, env, stdio: [slave, slave, slave], terminal: slave })
+    } catch (error) {
+      master.release()
+      throw error
+    } finally {
+      slave.release()
+    }
+    const state: Job = { proc, terminal: master, writing: Promise.resolve() }
+    jobs.set(job, state)
+    const reading = drain(master, output(job, 1), false)
+    void proc.exited.then(async (code) => {
+      // Show what it printed last, then close the terminal: what's left of the session hangs up.
+      await Promise.race([reading, new Promise((resolve) => setTimeout(resolve, 50))])
+      closeTerminal(state)
+      await reading
+      jobs.delete(job)
+      send({ t: 'exit', job, code })
+    })
+    return { pid: proc.pid }
+  }
+
+  function closeTerminal(state: Job): void {
+    const terminal = state.terminal
+    if (!terminal) return
+    state.terminal = undefined
+    terminal.release()
+  }
+
   function closeStdin(state: Job): void {
     const stdin = state.stdin
     if (!stdin) return
@@ -165,6 +205,11 @@ export function serveRuntime(kernel: Kernel, port: PortLike, options: ServeOptio
         break
       case 'stdin': {
         const state = jobs.get(message.job)
+        if (state?.terminal) {
+          if (message.data === null) closeTerminal(state)
+          else state.terminal.write(message.data)
+          break
+        }
         const stdin = state?.stdin
         if (!state || !stdin) break
         if (message.data === null) closeStdin(state)
@@ -174,6 +219,9 @@ export function serveRuntime(kernel: Kernel, port: PortLike, options: ServeOptio
         }
         break
       }
+      case 'resize':
+        jobs.get(message.job)?.terminal?.pty.resize({ cols: message.cols | 0, rows: message.rows | 0 })
+        break
       case 'signal': {
         const state = jobs.get(message.job)
         if (state?.abort) state.abort.abort()
@@ -206,7 +254,7 @@ function toRemoteError(error: unknown): RemoteError {
   return { message: error instanceof Error ? error.message : String(error) }
 }
 
-async function drain(file: OpenFile, onChunk: (chunk: Uint8Array) => void): Promise<void> {
+async function drain(file: OpenFile, onChunk: (chunk: Uint8Array) => void, release = true): Promise<void> {
   try {
     for (;;) {
       const chunk = await file.read(64 * 1024)
@@ -214,6 +262,6 @@ async function drain(file: OpenFile, onChunk: (chunk: Uint8Array) => void): Prom
       onChunk(chunk)
     }
   } finally {
-    file.release()
+    if (release) file.release()
   }
 }

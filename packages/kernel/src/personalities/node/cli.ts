@@ -106,12 +106,13 @@ export function parseCommandLine(lib: NodeLib, argv: string[], execPath: string,
 }
 
 /** Mirrors SelectLoadMode in src/node.cc. */
-export function selectMainScript(commandLine: CommandLine): string {
+export function selectMainScript(commandLine: CommandLine, stdinIsTerminal: () => boolean): string {
   const { options, argv } = commandLine
   if (options['[has_eval_string]'] && !options['--interactive']) return 'internal/main/eval_string'
   if (options['--check']) return 'internal/main/check_syntax'
   if (options['--test']) return 'internal/main/test_runner'
   if (options['--watch']) return 'internal/main/watch_mode'
   if (argv.length > 1 && argv[1] !== '-') return 'internal/main/run_main_module'
+  if (options['--interactive'] || stdinIsTerminal()) return 'internal/main/repl'
   return 'internal/main/eval_stdin'
 }

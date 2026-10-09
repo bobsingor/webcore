@@ -154,6 +154,11 @@ export const BUILTINS: Record<string, Builtin> = {
     return 0
   },
 
+  // Clears the screen and its scrollback, as ncurses' clear does on xterm.
+  clear: (shell, _argv, io) => {
+    shell.print(io.stdout, '\x1b[H\x1b[2J\x1b[3J')
+    return 0
+  },
   pwd: (shell, _argv, io) => {
     shell.print(io.stdout, `${shell.cwd}\n`)
     return 0

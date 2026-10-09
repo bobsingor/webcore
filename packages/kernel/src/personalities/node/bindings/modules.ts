@@ -1,5 +1,6 @@
 // contextify (CommonJS and vm scripts), module_wrap (ES modules) and cjs_lexer.
 import { compileFunction, evaluateExpression, runScript } from '../compile.ts'
+import { createVmContext, type VmContext } from '../vmcontext.ts'
 import {
   evaluate,
   hasAsyncGraph,
@@ -35,6 +36,12 @@ export function moduleBindings() {
   return {
     contextify: (realm: Realm) => {
       const hostDefinedOption = realm.privateSymbols.host_defined_option_symbol
+      const contextSymbol = realm.privateSymbols.contextify_context_private_symbol
+      const contextOf = (object: object): VmContext => {
+        const context = (object as Record<symbol, VmContext | undefined>)[contextSymbol]
+        if (!context) throw new TypeError('The "contextifiedObject" argument must be an vm.Context')
+        return context
+      }
       const defaultInternal = realm.perIsolateSymbols.vm_dynamic_import_default_internal
 
       class ContextifyScript {
@@ -69,7 +76,7 @@ export function moduleBindings() {
         /** A null context means the current one (vm.runInThisContext). */
         runInContext(context: object | null) {
           if (context === null) return runScript(this.source, this.filename)
-          throw new Error('vm contexts are not supported yet (webcore)')
+          return contextOf(context).run(`${this.source}\n//# sourceURL=${this.filename}`)
         }
 
         createCachedData() {
@@ -128,11 +135,18 @@ export function moduleBindings() {
           }
         },
         shouldRetryAsESM: (message: string) => ESM_SYNTAX_ERRORS.some((pattern) => pattern.test(message)),
-        makeContext: () => {
-          throw new Error('vm contexts are not supported yet (webcore)')
+        // A context is the sandbox seen through a global-scope Proxy (vmcontext.ts).
+        // vm.constants.DONT_CONTEXTIFY (a symbol) asks for a fresh global object instead.
+        makeContext: (sandbox: object | symbol) => {
+          const object = typeof sandbox === 'object' && sandbox !== null ? sandbox : {}
+          const context = createVmContext(object, () => realm.acorn)
+          Object.defineProperty(object, contextSymbol, { value: context, configurable: true })
+          return object === sandbox ? object : context.global
         },
         measureMemory: () => Promise.resolve({ total: { jsMemoryEstimate: 0, jsMemoryRange: [0, 0] } }),
-        startSigintWatchdog: () => {},
+        // The REPL's Ctrl+C watchdog interrupts a running evaluation. A Worker can't be interrupted
+        // mid-script, so it only reports success; ^C still reaches the REPL between evaluations.
+        startSigintWatchdog: () => true,
         stopSigintWatchdog: () => false,
         watchdogHasPendingSigint: () => false,
       }

@@ -15,7 +15,7 @@ browser's own JIT. Everything else runs as WebAssembly.
 Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design and roadmap, and
 [docs/adr/](docs/adr/README.md) for the decisions behind it.
 
-## Status: M1f, isolated runtime ✅
+## Status: M2a, terminal ✅
 
 `node` is **Node.js v24.21.0**: Node's own JavaScript standard library, unmodified, running on the
 browser's JavaScript engine over bindings written against the kernel. The bindings replace the C++
@@ -25,7 +25,9 @@ half of Node (ADR-0005, ADR-0012). Servers it starts open in a preview pane (ADR
 M1's exit criterion runs in the browser: `npm run dev` starts Vite 8 (with Rolldown's wasm build and
 its worker threads), the React app renders in the preview pane, and edits update it in place (HMR).
 The kernel runs in an iframe on its own, cross-origin-isolated origin. Pages embed it with
-`@webcore/sdk` and need no special headers in Chromium (ADR-0009, ADR-0017).
+`@webcore/sdk` and need no special headers in Chromium (ADR-0009, ADR-0017). The playground's
+terminal is xterm.js on a kernel pseudo-terminal, running an interactive shell with job control:
+Ctrl+C reaches the foreground job, and `node` starts Node's REPL (ADR-0018).
 
 ```sh
 user@webcore:~$ node -p "process.version + ' on ' + process.platform"
@@ -39,7 +41,11 @@ What works:
 
 - **Kernel:**
   - processes, fd tables, pipes with blocking reads, backpressure, EOF and EPIPE
-  - an in-memory VFS, `spawn`/`wait`/`kill`, signals reported as signals
+  - an in-memory VFS, `spawn`/`wait`/`kill`
+  - signals with per-process dispositions: default actions, ignored, or delivered to handlers
+    (ADR-0018)
+  - pseudo-terminals with Linux's line discipline (editing, echo, `^C`, raw mode, window size),
+    sessions, and foreground process groups (ADR-0018)
   - a kernel-side `spawnSync`
   - virtual TCP on one loopback host: `listen`/`accept`/`connect`/`shutdown` (ADR-0014)
   - symbolic and hard links, process groups (Ctrl+C stops a whole job), and `extract`, which
@@ -64,13 +70,17 @@ What works:
     and `node:wasi`, enough for wasm32-wasi N-API addons such as Rolldown (ADR-0016)
   - `fs.watch` (also recursive), `fs.promises.watch` and `fs.watchFile`
   - `v8.serialize` (V8's wire format, byte for byte) and `node:test`
-  - 68 of 72 builtin modules load; the rest are `repl` and the inspector modules (see
+  - terminals: `isTTY`, colors, window size and resize events, raw mode, `readline`, and the REPL
+  - `vm` contexts, approximated in one realm (a Worker can't create another)
+  - 69 of 72 builtin modules load; the rest are the inspector and trace modules (see
     [the M1 plan](docs/milestones/M1.md))
 - **npm and sh** (ADR-0015): webcore's own programs, running as processes on its Node.
   - **npm:** `install`, `ci`, `uninstall`, `run`, `exec`/`npx`, `init`/`create`, with npm's
     `node_modules` layout, lockfile and `.bin` links. Native packages are swapped for their
     wasm32-wasi builds.
-  - **sh:** a POSIX-subset shell, which Node's `child_process` uses as its shell.
+  - **sh:** a POSIX-subset shell, which Node's `child_process` uses as its shell. On a terminal
+    it's interactive: history, line editing and completion through Node's `readline`, and each
+    pipeline runs as a job in the foreground.
 - **Preview:** a server listening on a port is served in an iframe on `p<port>.localhost`, through a
   Service Worker and a bridge to the kernel. Page requests, cookies and WebSockets work (ADR-0014).
 - **WASI preview1:** args, env, preopens, files, directories, pipes, clocks, random, sleeps.
@@ -106,6 +116,14 @@ pnpm test
 ```
 
 `pnpm test` runs end to end in Node with real Workers and real Wasm.
+
+```bash
+pnpm test:node
+```
+
+`pnpm test:node` runs Node's own `test/parallel` files listed in
+`packages/kernel/test/node-parallel.txt`: the 2,746 of 4,543 that pass (or skip) on webcore today. The tests are fetched
+into a cache on first use. Add `--all` to run every file, and `--update` to refresh the list.
 
 ```bash
 pnpm typecheck
@@ -150,7 +168,12 @@ await runtime.fs.writeFile('/home/user/hello.js', 'console.log(6 * 7)')
 const { code, stdout } = await runtime.exec(['node', 'hello.js'])
 
 const shell = await runtime.createShell() // keeps cd and export between lines
-await shell.run('npm create vite@latest app -- --template react', { onStdout: (chunk) => term.write(chunk) })
+await shell.run('npm create vite@latest app -- --template react --no-interactive', { onStdout: (chunk) => log(chunk) })
+
+// A terminal for xterm.js: a login shell on a kernel pseudo-terminal
+const tty = await runtime.openTerminal({ cols: xterm.cols, rows: xterm.rows, onData: (chunk) => xterm.write(chunk) })
+xterm.onData((keys) => tty.write(keys))
+xterm.onResize(({ cols, rows }) => tty.resize(cols, rows))
 
 runtime.events.subscribe((event) => {
   if (event.type === 'net.listen') iframe.src = runtime.previewUrl(event.port)
@@ -201,8 +224,8 @@ const { code, stdout } = await exec(kernel, ['node', '-p', '6 * 7'], { env: { ..
 - **Background tabs are slow.** Browsers throttle hidden pages, and every process feels it.
 - **The VFS is in-memory and mutable.** The content-addressed copy-on-write store comes in M2
   (ADR-0007).
-- **No TTY/PTY yet**: stdio is pipes and files (M2).
-- **The terminal's shell is host-side and minimal.** It hands `rm`, `mkdir` and similar to
-  `/bin/sh`. A terminal that runs a shell process needs a PTY (M2), and coreutils arrive with
-  BusyBox via WASIX.
+- **Signals can't interrupt running code.** A handler runs once the program yields; default actions
+  still end the process at once. There's no stop/continue yet, so no `^Z`, `bg` or `fg` (M2c).
+- **The shell is webcore's own `sh`**, a POSIX subset with a few file utilities built in. bash,
+  BusyBox and coreutils arrive with WASIX in M2c.
 - **WASI binaries are hand-written WAT.** Real wasi-sdk/WASIX builds arrive in M2.

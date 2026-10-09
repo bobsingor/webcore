@@ -34,6 +34,7 @@ export function runNodejs(boot: BootMessage, sys: SyscallClient, platform: Platf
 
   const realm = new Realm({ boot, sys, platform, lib, commandLine })
   realm.loop.onExit = (code) => {
+    for (const hook of realm.atExit) hook()
     if (boot.thread) endThread(realm, code)
     if (boot.env.WEBCORE_TRACE_BINDINGS) stderr(realm.trace.report())
   }

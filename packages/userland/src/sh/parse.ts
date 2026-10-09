@@ -40,7 +40,15 @@ export interface AndOr {
 
 export type List = { andOr: AndOr; background: boolean }[]
 
-export class ShellSyntaxError extends Error {}
+export class ShellSyntaxError extends Error {
+  /** The input ended mid-construct: an interactive shell asks for more (PS2). */
+  readonly incomplete: boolean
+
+  constructor(message: string, incomplete = false) {
+    super(message)
+    this.incomplete = incomplete
+  }
+}
 
 const RESERVED = new Set(['if', 'then', 'elif', 'else', 'fi', 'for', 'in', 'do', 'done', 'while', 'until', '{', '}', '!'])
 const NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
@@ -475,6 +483,7 @@ class Parser {
   }
 
   private fail(message: string): never {
-    throw new ShellSyntaxError(message)
+    const atEnd = !this.src.slice(this.pos).trim()
+    throw new ShellSyntaxError(message, atEnd || /^unterminated /.test(message))
   }
 }

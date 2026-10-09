@@ -1,5 +1,6 @@
 import type { Dirent, Stat } from './constants.ts'
 import type { ExtractOptions } from '../kernel/extract.ts'
+import type { SignalAction, WinSize } from './signals.ts'
 
 export interface SpawnSyncRequest {
   cwd?: string
@@ -28,8 +29,14 @@ export interface SpawnRequest {
   env?: Record<string, string>
   /** Caller fds that become the child's 0, 1 and 2. A negative value means /dev/null. */
   fds?: [number, number, number]
-  /** Start a new process group instead of joining the caller's. */
+  /** Start a new session and process group (setsid), as Node's `detached` does. */
   detached?: boolean
+  /**
+   * The child's process group, as posix_spawn's POSIX_SPAWN_SETPGROUP: 0 starts a new group led by
+   * the child, another value joins that group in the caller's session. A shell runs each job in
+   * its own group.
+   */
+  pgid?: number
 }
 
 export type AddressFamily = 'IPv4' | 'IPv6'
@@ -81,10 +88,27 @@ export interface Syscalls {
   spawn(argv: string[], request?: SpawnRequest): number
   wait(pid: number): number
   /**
-   * Signal 0 checks that the process exists; any other signal terminates it with 128 + signal. A
-   * negative pid targets the process group -pid, and 0 the caller's own group.
+   * Sends a signal. Signal 0 only checks that the process exists. A negative pid targets the
+   * process group -pid, and 0 the caller's own group. The target's disposition decides what
+   * happens: the default action (terminating with 128 + signal for most signals), nothing, or
+   * delivery to its handler.
    */
   kill(pid: number, signal: number): number
+  /** Sets how the caller treats `signal`; returns the previous disposition. SIGKILL can't change. */
+  sigaction(signal: number, action: SignalAction): SignalAction
+  /** Starts a new session and process group led by the caller; EPERM for a group leader. */
+  setsid(): number
+  /** The session of `pid` (0: the caller). */
+  getsid(pid: number): number
+  /** Moves `pid` (0: the caller) into group `pgid` (0: its own) within its session. */
+  setpgid(pid: number, pgid: number): number
+  /**
+   * Terminal requests in Linux's numbering (TCGETS, TCSETS, TIOCGWINSZ, TIOCSPGRP, …): termios
+   * and window sizes travel as objects. ENOTTY for an fd that isn't a terminal.
+   */
+  ioctl(fd: number, request: number, arg?: unknown): unknown
+  /** Creates a pseudo-terminal: [master fd, slave fd]. */
+  openpty(size?: WinSize): [master: number, slave: number]
   /** Like wait, but distinguishes exit codes from signals: [code, signal] (one of them is null). */
   waitStatus(pid: number): [code: number | null, signal: number | null]
   /** Runs a child to completion, inside the kernel (see SPAWN_SYNC_HEADER_BYTES). */

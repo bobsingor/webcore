@@ -3,6 +3,7 @@
 import type { Realm } from '../realm.ts'
 import { VERSIONS } from '../versions.ts'
 import { host } from '../host.ts'
+import { isTerminal } from './streams.ts'
 
 const toString = (value: unknown) => Object.prototype.toString.call(value)
 
@@ -209,8 +210,9 @@ export function supportBindings() {
       privateSymbols: realm.privateSymbols,
       shouldAbortOnUncaughtToggle: new Int32Array(1),
       constructSharedArrayBuffer: (length = 0) => new SharedArrayBuffer(length),
-      // ['TCP', 'TTY', 'UDP', 'FILE', 'PIPE', 'UNKNOWN']; pipes are FILEs until pipe_wrap (M1c).
+      // ['TCP', 'TTY', 'UDP', 'FILE', 'PIPE', 'UNKNOWN']. Pipes are read and written as files.
       guessHandleType: (fd: number) => {
+        if (isTerminal(realm, fd)) return 1
         try {
           const { type } = realm.sys.call('fstat', fd)
           return type === 'dir' ? 5 : 3

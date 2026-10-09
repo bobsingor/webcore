@@ -1,4 +1,5 @@
 import { kerr } from '../abi/errno.ts'
+import type { SignalAction } from '../abi/signals.ts'
 import type { OpenFile } from './files.ts'
 
 const MAX_FDS = 1024
@@ -34,6 +35,10 @@ export class Process {
   readonly ppid: number
   /** Process group: a job that receives terminal signals together, as on Linux. */
   pgid: number
+  /** Session: the processes that share a controlling terminal. */
+  sid: number
+  /** Signals the process ignores or handles; the rest take their default action. */
+  readonly dispositions = new Map<number, Exclude<SignalAction, 'default'>>()
   readonly argv: string[]
   readonly env: Record<string, string>
   cwd: string
@@ -54,10 +59,11 @@ export class Process {
   nextThreadId = 1
   private resolveExit!: (code: number) => void
 
-  constructor(init: { pid: number; ppid: number; pgid?: number; argv: string[]; env: Record<string, string>; cwd: string }) {
+  constructor(init: { pid: number; ppid: number; pgid?: number; sid?: number; argv: string[]; env: Record<string, string>; cwd: string }) {
     this.pid = init.pid
     this.ppid = init.ppid
     this.pgid = init.pgid ?? init.pid
+    this.sid = init.sid ?? init.pid
     this.argv = init.argv
     this.env = init.env
     this.cwd = init.cwd

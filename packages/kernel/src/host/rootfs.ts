@@ -17,6 +17,11 @@ npm are webcore's own programs. Pipes, files, sockets, child processes and exit
 codes are shared between them.
 `
 
+// Read by login shells (sh -l): a colored prompt, then the welcome message.
+const PROFILE = `PS1='\\[\\e[1;32m\\]\\u@\\h\\[\\e[0m\\]:\\[\\e[1;34m\\]\\w\\[\\e[0m\\]\\$ '
+cat /etc/motd
+`
+
 /** webcore's JavaScript programs (sh, npm): @webcore/userland's dist/userland.json. */
 export interface Userland {
   /** Path → content. */
@@ -48,5 +53,6 @@ export function installRootfs(kernel: Kernel, binaries: Record<string, Uint8Arra
     }
   }
   fs.writeFile('/etc/motd', MOTD)
+  fs.writeFile('/etc/profile', PROFILE)
   fs.writeFile('/etc/hostname', 'webcore\n')
 }

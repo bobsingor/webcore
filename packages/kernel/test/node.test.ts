@@ -27,7 +27,7 @@ describe('runtime', () => {
   it('orders ticks, promises, immediates and timers like Node', async () => {
     // As in Node, an expired timer runs before immediates, so the delay must outlast a busy machine.
     const { stdout } = await node(
-      "setTimeout(() => console.log('timeout'), 100); setImmediate(() => console.log('immediate')); process.nextTick(() => console.log('tick')); Promise.resolve().then(() => console.log('promise')); console.log('sync')",
+      "setTimeout(() => console.log('timeout'), 250); setImmediate(() => console.log('immediate')); process.nextTick(() => console.log('tick')); Promise.resolve().then(() => console.log('promise')); console.log('sync')",
     )
     expect(stdout).toBe('sync\ntick\npromise\nimmediate\ntimeout\n')
   })
@@ -120,8 +120,6 @@ describe('bindings', () => {
       "const failed = []; for (const id of require('module').builtinModules) { try { require(id) } catch { failed.push(id) } } console.log(failed.join(' '))",
     )
     const later = [
-      // vm contexts
-      'repl',
       // Like official builds without them
       'inspector', 'inspector/promises', 'trace_events',
     ]

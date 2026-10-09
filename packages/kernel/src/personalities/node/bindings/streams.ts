@@ -5,6 +5,28 @@
 // Reads: readStart() pumps async read syscalls; each chunk is delivered as onread(arrayBuffer)
 // with streamBaseState[kReadBytesOrError] set, and UV_EOF at the end. Writes complete
 // asynchronously through req.oncomplete(status). An active, referenced handle keeps the loop alive.
+import {
+  CS8,
+  ECHO,
+  ECHONL,
+  ICANON,
+  ICRNL,
+  IEXTEN,
+  IGNCR,
+  INLCR,
+  ISIG,
+  ISTRIP,
+  IXON,
+  ONLCR,
+  OPOST,
+  TCGETS,
+  TCSETSW,
+  TIOCGWINSZ,
+  VMIN,
+  VTIME,
+  type Termios,
+  type WinSize,
+} from '../../../abi/signals.ts'
 import type { SocketAddress, SocketInfo } from '../../../abi/syscalls.ts'
 import { familyOf, isLocalAddress } from '../../../kernel/net.ts'
 import { bytesOf, encode } from '../codec.ts'
@@ -27,6 +49,26 @@ const UV_EAI_NONAME = -3008
 const READ_CHUNK = 64 * 1024
 const DNS_ORDER_IPV6_FIRST = 2
 const kProcessFlagDetached = 1
+const UV_TTY_MODE_NORMAL = 0
+const UV_TTY_MODE_RAW = 1
+const UV_TTY_MODE_IO = 2
+// termios bits libuv changes (asm-generic/termbits.h)
+const IGNBRK = 0o1
+const BRKINT = 0o2
+const PARMRK = 0o10
+const INPCK = 0o20
+const CSIZE = 0o60
+const PARENB = 0o400
+
+/** isatty(): whether `fd` is a terminal (TCGETS succeeds). */
+export function isTerminal(realm: Realm, fd: number): boolean {
+  try {
+    realm.sys.call('ioctl', fd, TCGETS)
+    return true
+  } catch {
+    return false
+  }
+}
 
 type Request = { oncomplete?: (...args: unknown[]) => void; handle?: unknown }
 
@@ -182,6 +224,7 @@ export function createStreams(realm: Realm) {
 
     protected override onClose(): void {
       this.wantRead = false
+      this.settleDrained()
       if (this.fd >= 0 && !this.fdReleased) {
         try {
           sys.call('close', this.fd)
@@ -195,6 +238,7 @@ export function createStreams(realm: Realm) {
     private write(req: Request, data: Uint8Array): number {
       if (this.fd < 0 || this.shut) return UV_EBADF
       streamBaseState[kBytesWritten] = data.length
+      if (this.blocking) return this.writeNow(data)
       streamBaseState[kLastWriteWasAsync] = 1
       this.pendingWrites++
       this.updateActive()
@@ -237,7 +281,30 @@ export function createStreams(realm: Realm) {
       } finally {
         this.pumping = false
         this.updateActive()
+        if (!this.wantRead || this.fd < 0) this.settleDrained()
       }
+    }
+
+    private drainedWaiters: (() => void)[] = []
+
+    /**
+     * Resolves once reading has reached the end (or nobody reads, or `limit` ms passed). A child's
+     * exit waits for this on its stdio pipes: in Node, libuv delivers a child's last output before
+     * its exit in practice, and programs rely on that.
+     */
+    drained(limit: number): Promise<void> {
+      if (!this.wantRead || this.fd < 0) return Promise.resolve()
+      return new Promise((resolve) => {
+        const timer = host.setTimeout(resolve, limit)
+        this.drainedWaiters.push(() => {
+          host.clearTimeout(timer)
+          resolve()
+        })
+      })
+    }
+
+    private settleDrained(): void {
+      for (const resolve of this.drainedWaiters.splice(0)) resolve()
     }
 
     private deliver(nread: number, chunk?: Uint8Array): void {
@@ -247,6 +314,22 @@ export function createStreams(realm: Realm) {
         streamBaseState[kArrayBufferOffset] = 0
         this.onread?.call(this, buffer as ArrayBuffer | undefined)
       })
+    }
+
+    /** Blocking handles (TTYs after setBlocking(true), as libuv makes them) write synchronously. */
+    protected blocking = false
+
+    private writeNow(data: Uint8Array): number {
+      streamBaseState[kLastWriteWasAsync] = 0
+      try {
+        for (let offset = 0; offset < data.length; offset += sys.maxPayload) {
+          sys.call('write', this.fd, data.subarray(offset, offset + sys.maxPayload))
+        }
+      } catch (error) {
+        return uvCode(error)
+      }
+      this.bytesWritten += data.length
+      return 0
     }
 
     /** Whether pending work keeps the handle active (and the loop alive while referenced). */
@@ -436,20 +519,80 @@ export function createStreams(realm: Realm) {
     }
   }
 
+  // libuv's terminal modes. The first switch away from normal mode saves the terminal's settings;
+  // normal mode, and the process's exit (uv_tty_reset_mode), restore them.
+  let savedTermios: { fd: number; termios: Termios } | undefined
+  const setTtyMode = (fd: number, mode: number): number => {
+    try {
+      const current = sys.call('ioctl', fd, TCGETS) as Termios
+      if (mode === UV_TTY_MODE_NORMAL) {
+        if (savedTermios?.fd === fd) sys.call('ioctl', fd, TCSETSW, savedTermios.termios)
+        return 0
+      }
+      if (!savedTermios) {
+        savedTermios = { fd, termios: current }
+        realm.atExit.add(() => {
+          try {
+            sys.call('ioctl', fd, TCSETSW, savedTermios!.termios)
+          } catch {
+            // The terminal is gone.
+          }
+        })
+      }
+      const base = savedTermios.fd === fd ? savedTermios.termios : current
+      const next: Termios = { ...base, cc: [...base.cc] }
+      if (mode === UV_TTY_MODE_IO) {
+        // cfmakeraw()
+        next.iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON)
+        next.oflag &= ~OPOST
+        next.lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN)
+        next.cflag = (next.cflag & ~(CSIZE | PARENB)) | CS8
+      } else {
+        next.iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON)
+        next.oflag |= ONLCR
+        next.cflag |= CS8
+        next.lflag &= ~(ECHO | ICANON | IEXTEN | ISIG)
+      }
+      next.cc[VMIN] = 1
+      next.cc[VTIME] = 0
+      sys.call('ioctl', fd, TCSETSW, next)
+      return 0
+    } catch (error) {
+      return uvCode(error)
+    }
+  }
+
+  /** A terminal fd (tty_wrap): the kernel's PTY slave, as stdin, stdout or stderr. */
   class TTY extends StreamHandle {
-    constructor(fd: number) {
+    constructor(fd: number, ctx?: { code?: string; errno?: number; syscall?: string }) {
       super()
       this.fd = fd
+      try {
+        sys.call('ioctl', fd, TCGETS)
+      } catch (error) {
+        if (ctx) Object.assign(ctx, { errno: uvCode(error), code: (error as SysError).code ?? 'EINVAL', syscall: 'uv_tty_init' })
+      }
     }
+
     getWindowSize(size: number[]): number {
-      size[0] = 80
-      size[1] = 24
-      return 0
+      try {
+        const { cols, rows } = sys.call('ioctl', this.fd, TIOCGWINSZ) as WinSize
+        size[0] = cols
+        size[1] = rows
+        return 0
+      } catch (error) {
+        return uvCode(error)
+      }
     }
-    setRawMode(): number {
-      return 0
+
+    setRawMode(flag: boolean | number): number {
+      // Node passes a mode (UV_TTY_MODE_*) or, from older call sites, a boolean.
+      const mode = typeof flag === 'number' ? flag : flag ? UV_TTY_MODE_RAW : UV_TTY_MODE_NORMAL
+      return setTtyMode(this.fd, mode)
     }
-    setBlocking(): number {
+
+    setBlocking(flag: boolean): number {
+      this.blocking = Boolean(flag)
       return 0
     }
   }
@@ -502,7 +645,13 @@ export function createStreams(realm: Realm) {
       // The child holds its own references; ours would keep its pipes from reaching EOF.
       for (const fd of childEnds) sys.call('close', fd)
       this.setActive(true)
-      void sys.callAsync('waitStatus', this.pid).then(([code, signal]) => {
+      const outputs = options.stdio
+        .slice(1)
+        .filter((option) => option?.type === 'pipe' || option?.type === 'overlapped')
+        .map((option) => option!.handle as unknown as StreamHandle | undefined)
+      void sys.callAsync('waitStatus', this.pid).then(async ([code, signal]) => {
+        // The child's last output first, then its exit.
+        await Promise.all(outputs.map((handle) => handle?.drained?.(50)))
         this.setActive(false)
         loop.callback(() => this.onexit?.call(this, code ?? 0, signalName(signal) ?? ''))
       })
@@ -581,11 +730,10 @@ export function streamBindings() {
     }),
     tty_wrap: (realm: Realm) => ({
       TTY: streamsOf(realm).TTY,
-      // No terminal device yet: everything is a pipe or file (PTY arrives in M2).
-      isTTY: () => false,
-      UV_TTY_MODE_NORMAL: 0,
-      UV_TTY_MODE_RAW: 1,
-      UV_TTY_MODE_IO: 2,
+      isTTY: (fd: number) => isTerminal(realm, fd),
+      UV_TTY_MODE_NORMAL,
+      UV_TTY_MODE_RAW,
+      UV_TTY_MODE_IO,
       UV_TTY_MODE_RAW_VT: 3,
     }),
     process_wrap: (realm: Realm) => ({

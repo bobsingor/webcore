@@ -23,3 +23,4 @@ acceptance except to change their status. A decision is reversed by a new record
 | [0015](0015-own-npm-and-userland.md) | npm and sh are webcore programs; the kernel unpacks packages | Accepted · implemented in M1d |
 | [0016](0016-threads-and-worker-threads.md) | Threads are Workers inside a process; worker_threads runs on host MessagePorts | Accepted · implemented in M1e |
 | [0017](0017-runtime-frame-and-sdk.md) | The runtime frame isolates itself; pages reach it through one MessagePort | Accepted · implemented in M1f |
+| [0018](0018-signals-and-terminals.md) | Signals are dispositions in the kernel; terminals are kernel PTYs | Accepted · implemented in M2a |

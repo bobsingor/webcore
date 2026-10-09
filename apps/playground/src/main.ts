@@ -1,4 +1,7 @@
-import { connect, type Runtime, type RuntimeEvent, type ShellSession } from '@webcore/sdk'
+import { connect, type Runtime, type RuntimeEvent, type RuntimeTerminal } from '@webcore/sdk'
+import { FitAddon } from '@xterm/addon-fit'
+import { Terminal } from '@xterm/xterm'
+import '@xterm/xterm/css/xterm.css'
 import './style.css'
 
 // The runtime runs on its own origin (ADR-0009, ADR-0017): @webcore/runtime's dev server, unless
@@ -114,7 +117,7 @@ const EXAMPLES: Example[] = [
   },
   {
     label: 'npm create vite (React)',
-    command: 'cd /home/user && npm create vite@latest my-app -- --template react',
+    command: 'cd /home/user && npm create vite@latest my-app -- --template react --no-interactive',
   },
   {
     label: 'npm install',
@@ -136,9 +139,6 @@ const EXAMPLES: Example[] = [
 ]
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T
-const output = $<HTMLDivElement>('output')
-const input = $<HTMLInputElement>('input')
-const ps1 = $<HTMLLabelElement>('ps1')
 const status = $<HTMLDivElement>('status')
 const eventsList = $<HTMLOListElement>('events')
 const eventCount = $<HTMLSpanElement>('event-count')
@@ -149,25 +149,7 @@ const addressPort = $<HTMLSpanElement>('address-port')
 const addressPath = $<HTMLInputElement>('address-path')
 const frame = $<HTMLIFrameElement>('frame')
 
-let session: ShellSession | undefined
-const history: string[] = []
-let historyIndex = 0
-let running: AbortController | undefined
 let eventTotal = 0
-
-function print(text: string, className = 'out'): void {
-  const last = output.lastElementChild
-  if (last instanceof HTMLSpanElement && last.className === className) last.textContent += text
-  else output.append(Object.assign(document.createElement('span'), { className, textContent: text }))
-  output.scrollTop = output.scrollHeight
-}
-
-function renderPrompt(): void {
-  const home = session?.env.HOME ?? ''
-  const where = session?.cwd ?? '/home/user'
-  const cwd = home && where.startsWith(home) ? `~${where.slice(home.length)}` : where
-  ps1.textContent = `user@webcore:${cwd}$`
-}
 
 function setStatus(text: string, state: 'booting' | 'ready' | 'busy' | 'error'): void {
   status.textContent = text
@@ -254,103 +236,85 @@ function setupPreview(runtime: Runtime): void {
   })
 }
 
-async function run(line: string, echo = true): Promise<number> {
-  if (echo) print(`${ps1.textContent} ${line}\n`, 'cmd')
-  if (line.trim() === 'clear') {
-    output.replaceChildren()
-    return 0
-  }
-  if (line.trim() === 'help') {
-    print(`Commands: echo, cat, wc, ls (WASI) · node, npm, npx, sh (JS) · cd, pwd, export, true, false (shell builtins)\n`)
-    print(`Operators: |  >  >>  <  &&  ||  ;   Ctrl+C kills the running pipeline.\n`)
-    return 0
-  }
-  const decoders = { out: new TextDecoder(), err: new TextDecoder() }
-  running = new AbortController()
-  input.disabled = true
-  setStatus('running…', 'busy')
-  const started = performance.now()
-  const code = await session!.run(line, {
-    signal: running.signal,
-    onStdout: (chunk) => print(decoders.out.decode(chunk, { stream: true })),
-    onStderr: (chunk) => print(decoders.err.decode(chunk, { stream: true }), 'err'),
-  })
-  const elapsed = performance.now() - started
-  print(`[exit ${code} · ${elapsed.toFixed(0)} ms]\n`, 'meta')
-  running = undefined
-  input.disabled = false
-  input.focus()
-  renderPrompt()
-  setStatus(READY, 'ready')
-  return code
-}
-
 const READY = `ready · runtime on ${new URL(RUNTIME_URL).host}`
+
+/**
+ * The terminal: xterm.js on a pseudo-terminal in the runtime (M2a), running a login shell. When
+ * the shell exits, a new one starts.
+ */
+function setupTerminal(runtime: Runtime): { type(text: string): void; current(): RuntimeTerminal | undefined } {
+  const term = new Terminal({
+    fontFamily: "ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace",
+    fontSize: 13,
+    lineHeight: 1.2,
+    cursorBlink: true,
+    scrollback: 5000,
+    theme: { background: '#131821', foreground: '#d7dde8', cursor: '#7cc4ff', selectionBackground: '#2a3446' },
+  })
+  const fit = new FitAddon()
+  term.loadAddon(fit)
+  const container = $<HTMLDivElement>('term')
+  term.open(container)
+  fit.fit()
+  new ResizeObserver(() => fit.fit()).observe(container)
+
+  let session: RuntimeTerminal | undefined
+  const encoder = new TextEncoder()
+  term.onData((data) => session?.write(encoder.encode(data)))
+  term.onResize(({ cols, rows }) => session?.resize(cols, rows))
+  void (async () => {
+    for (;;) {
+      session = await runtime.openTerminal({ cols: term.cols, rows: term.rows, onData: (chunk) => term.write(chunk) })
+      const code = await session.exited
+      term.write(`\r\n\x1b[2m[sh exited with status ${code}; starting a new shell]\x1b[0m\r\n`)
+    }
+  })()
+  term.focus()
+  return {
+    // As if typed: ^E ^U clear whatever is on the line first.
+    type: (text) => {
+      session?.write(encoder.encode(`\x05\x15${text}\r`))
+      term.focus()
+    },
+    current: () => session,
+  }
+}
 
 async function boot(): Promise<void> {
   setStatus('starting runtime…', 'booting')
   let runtime: Runtime
   try {
     runtime = await connect({ url: RUNTIME_URL })
-    session = await runtime.createShell()
   } catch (error) {
     setStatus('runtime unavailable', 'error')
-    print(`Could not start the webcore runtime at ${RUNTIME_URL}: ${(error as Error).message}\n`, 'err')
+    $<HTMLDivElement>('term').textContent = `Could not start the webcore runtime at ${RUNTIME_URL}: ${(error as Error).message}`
     return
   }
   runtime.events.subscribe(logEvent)
   setupPreview(runtime)
+  const terminal = setupTerminal(runtime)
+  setStatus(READY, 'ready')
 
   const examples = $<HTMLDivElement>('examples')
+  let notice: ReturnType<typeof setTimeout> | undefined
   for (const example of EXAMPLES) {
     const button = Object.assign(document.createElement('button'), { type: 'button', textContent: example.label })
     button.title = example.command || example.label
     button.addEventListener('click', async () => {
       if (example.action) {
-        print(await example.action(runtime), 'meta')
+        setStatus((await example.action(runtime)).trim(), 'ready')
+        clearTimeout(notice)
+        notice = setTimeout(() => setStatus(READY, 'ready'), 5000)
         return
       }
-      if (running) return
       await example.prepare?.(runtime)
-      input.value = example.command
-      void submit()
+      terminal.type(example.command)
     })
     examples.append(button)
   }
 
-  const submit = async () => {
-    const line = input.value
-    input.value = ''
-    if (line.trim()) {
-      history.push(line)
-      historyIndex = history.length
-    }
-    await run(line)
-  }
-
-  $<HTMLFormElement>('prompt').addEventListener('submit', (event) => {
-    event.preventDefault()
-    if (!running) void submit()
-  })
-  document.addEventListener('keydown', (event) => {
-    if (event.key === 'c' && event.ctrlKey && running) {
-      event.preventDefault()
-      print('^C\n', 'err')
-      running.abort()
-    }
-  })
-  input.addEventListener('keydown', (event) => {
-    if (event.key === 'ArrowUp' && historyIndex > 0) input.value = history[--historyIndex]
-    else if (event.key === 'ArrowDown') input.value = history[++historyIndex] ?? ''
-    else return
-    event.preventDefault()
-  })
-
   // Exposed for debugging from the console.
-  Object.assign(globalThis, { webcore: { runtime, session, run } })
-
-  renderPrompt()
-  await run('cat /etc/motd', false)
+  Object.assign(globalThis, { webcore: { runtime, terminal: terminal.current } })
 }
 
 void boot()

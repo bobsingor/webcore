@@ -1,6 +1,7 @@
 import { errnoMessage, errnoName } from '../abi/errno.ts'
 import { awaitSync, beginSync, pageCapacity, park } from '../abi/page.ts'
 import type { SyscallReply, SyscallRequest } from '../abi/protocol.ts'
+import type { SignalMessage } from '../abi/signals.ts'
 import type { SyscallArgs, SyscallName, SyscallReturn } from '../abi/syscalls.ts'
 
 /** A failed syscall, as seen inside a process. `errno` uses Linux numbering. */
@@ -27,6 +28,8 @@ interface Pending {
 export class SyscallClient {
   /** Largest payload a single sync result can carry (bounds `read`). */
   readonly maxPayload: number
+  /** Receives the signals this process handles (see the sigaction syscall). */
+  onSignal?: (signal: number) => void
   private readonly port: MessagePort
   private readonly page: SharedArrayBuffer
   private readonly pending = new Map<number, Pending>()
@@ -36,7 +39,7 @@ export class SyscallClient {
     this.port = port
     this.page = page
     this.maxPayload = pageCapacity(page)
-    port.addEventListener('message', (event) => this.onReply(event.data))
+    port.addEventListener('message', (event) => this.onMessage(event.data))
     port.start()
   }
 
@@ -72,7 +75,11 @@ export class SyscallClient {
     this.port.postMessage(request, transfer)
   }
 
-  private onReply(reply: SyscallReply): void {
+  private onMessage(reply: SyscallReply | SignalMessage): void {
+    if (reply?.t === 'sig') {
+      this.onSignal?.(reply.signal)
+      return
+    }
     if (reply?.t !== 'ret') return
     const pending = this.pending.get(reply.id)
     if (!pending) return

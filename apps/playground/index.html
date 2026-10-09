@@ -10,18 +10,14 @@
       <div class="brand">
         <span class="logo" aria-hidden="true"></span>
         <span class="name">webcore</span>
-        <span class="tag">M1f · isolated runtime</span>
+        <span class="tag">M2a · terminal</span>
       </div>
       <div id="status" class="status" data-state="booting">booting kernel…</div>
     </header>
 
     <main class="layout">
       <section class="terminal" aria-label="Terminal">
-        <div id="output" class="output" role="log" aria-live="polite"></div>
-        <form id="prompt" class="prompt">
-          <label id="ps1" class="ps1" for="input"></label>
-          <input id="input" autocomplete="off" autocapitalize="off" spellcheck="false" disabled />
-        </form>
+        <div id="term" class="term"></div>
       </section>
 
       <section id="preview" class="preview" aria-label="Preview" hidden>

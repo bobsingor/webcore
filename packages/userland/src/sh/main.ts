@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 // sh: webcore's shell. `sh -c 'command' [name [args…]]`, `sh script [args…]`, or a script on
-// stdin. The language is a POSIX subset (see parse.ts); commands run on the kernel directly.
+// stdin. With a terminal on stdin (or -i) it is interactive (interactive.ts); -l makes it a login
+// shell. The language is a POSIX subset (see parse.ts); commands run on the kernel directly.
 import { readFileSync } from 'node:fs'
+import { interactive } from './interactive.ts'
 import { parse, ShellSyntaxError } from './parse.ts'
 import { ExitSignal, Shell } from './shell.ts'
 
@@ -9,6 +11,8 @@ async function main(argv: string[]): Promise<number> {
   let command: string | undefined
   let errexit = false
   let xtrace = false
+  let forceInteractive = false
+  let login = false
   let i = 0
   for (; i < argv.length; i++) {
     const arg = argv[i]
@@ -19,6 +23,8 @@ async function main(argv: string[]): Promise<number> {
     if (!/^[-+][a-z]+$/.test(arg)) break
     if (arg.includes('e')) errexit = true
     if (arg.includes('x')) xtrace = true
+    if (arg.includes('i')) forceInteractive = true
+    if (arg.includes('l')) login = true
     if (arg.includes('c')) {
       command = argv[++i]
       if (command === undefined) {
@@ -28,6 +34,11 @@ async function main(argv: string[]): Promise<number> {
     }
   }
   const rest = argv.slice(i)
+
+  if (command === undefined && !rest.length && (forceInteractive || process.stdin.isTTY)) {
+    const shell = new Shell({ env: { ...process.env } as Record<string, string>, cwd: process.cwd() })
+    return interactive(shell, { login })
+  }
 
   let source: string
   let arg0 = 'sh'

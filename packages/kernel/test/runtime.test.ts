@@ -99,6 +99,33 @@ describe('runtime processes', () => {
   })
 })
 
+describe('runtime terminals', () => {
+  it('runs programs on a terminal, with keystrokes, resizes and hang-up', async () => {
+    let screen = ''
+    const decoder = new TextDecoder()
+    const onData = (chunk: Uint8Array) => (screen += decoder.decode(chunk, { stream: true }))
+    const tty = await runtime.openTerminal({ command: ['node', '-p', "process.stdout.isTTY + ' ' + process.stdout.columns + ' ' + process.env.TERM"], cols: 90, onData })
+    expect(await tty.exited).toBe(0)
+    expect(screen).toBe('true 90 xterm-256color\r\n')
+
+    screen = ''
+    const shell = await runtime.openTerminal({ onData })
+    const waitFor = async (pattern: RegExp) => {
+      for (let i = 0; i < 800 && !pattern.test(screen); i++) await new Promise((resolve) => setTimeout(resolve, 10))
+      expect(screen).toMatch(pattern)
+    }
+    // The prompt, then readline's cursor positioning.
+    await waitFor(/\$ (\x1b\[\d+G)?$/)
+    shell.resize(120, 40)
+    shell.write('node -p process.stdout.columns\r')
+    // On a TTY, node -p prints with colors, as real Node does.
+    await waitFor(/\x1b\[33m120\x1b\[39m\r\n/)
+    // Closing the terminal hangs up: the shell dies of SIGHUP.
+    shell.close()
+    expect(await shell.exited).toBe(129)
+  })
+})
+
 describe('runtime previews', () => {
   it('builds preview URLs and recognizes only its own preview origins', () => {
     expect(runtime.previewUrl(3000, '/a b')).toBe('http://p3000.localhost:5190/__webcore/boot.html?path=%2Fa%20b')

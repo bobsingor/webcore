@@ -118,50 +118,14 @@ body {
   background: var(--panel);
 }
 
-.output {
+.term {
   flex: 1;
-  overflow: auto;
-  padding: 18px 20px 8px;
-  font: 13px/1.55 var(--mono);
-  white-space: pre-wrap;
-  word-break: break-word;
+  min-height: 0;
+  padding: 14px 6px 6px 16px;
 }
 
-.output .cmd {
-  color: var(--accent);
-}
-
-.output .err {
-  color: var(--err);
-}
-
-.output .meta {
-  color: var(--muted);
-  font-size: 11px;
-}
-
-.prompt {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 10px 20px 16px;
-  font: 13px var(--mono);
-}
-
-.ps1 {
-  color: var(--ok);
-  white-space: nowrap;
-}
-
-.prompt input {
-  flex: 1;
-  min-width: 0;
-  border: 0;
-  outline: 0;
-  background: transparent;
-  color: var(--text);
-  font: inherit;
-  caret-color: var(--accent);
+.term .xterm {
+  height: 100%;
 }
 
 .side {
@@ -384,9 +348,7 @@ body {
     border-top: 1px solid var(--line);
   }
 
-  .top,
-  .output,
-  .prompt {
+  .top {
     padding-left: 16px;
     padding-right: 16px;
   }

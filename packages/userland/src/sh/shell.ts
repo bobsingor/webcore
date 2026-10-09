@@ -9,6 +9,22 @@ export interface IO {
   stdin: number
   stdout: number
   stderr: number
+  /** The job the command belongs to, under job control. */
+  job?: Job
+}
+
+/** A pipeline under job control: its processes share a group, which gets the terminal. */
+export interface Job {
+  /** The terminal the job runs on. */
+  tty: number
+  /** The group, once its first process exists. */
+  pgid?: number
+}
+
+/** An interactive shell's terminal and its own process group. */
+export interface JobControl {
+  tty: number
+  pgid: number
 }
 
 /** Thrown by `exit` to unwind to the top. */
@@ -41,6 +57,8 @@ export class Shell {
   lastBackground = 0
   /** Called with each child's pid (used for $!). */
   onSpawn?: (pid: number) => void
+  /** Set in an interactive shell on a terminal. Subshells (clones) don't have it. */
+  jobControl?: JobControl
   private readonly jobs = new Set<Promise<number>>()
 
   constructor(init: { env: Record<string, string>; cwd: string; arg0?: string; positional?: string[] }) {
@@ -123,7 +141,27 @@ export class Shell {
     return status
   }
 
-  private async runPipeline(pipeline: Pipeline, io: IO, conditional: boolean): Promise<number> {
+  private async runPipeline(pipeline: Pipeline, outer: IO, conditional: boolean): Promise<number> {
+    // Under job control each pipeline is a job: a process group of its own, in the foreground.
+    const io: IO = this.jobControl && !outer.job ? { ...outer, job: { tty: this.jobControl.tty } } : outer
+    try {
+      return await this.runJob(pipeline, io, conditional)
+    } finally {
+      if (io !== outer && io.job?.pgid !== undefined) this.takeTerminal()
+    }
+  }
+
+  /** Gives the terminal back to the shell's own group. */
+  private takeTerminal(): void {
+    if (!this.jobControl) return
+    try {
+      sys.tcsetpgrp(this.jobControl.tty, this.jobControl.pgid)
+    } catch {
+      // The terminal is gone.
+    }
+  }
+
+  private async runJob(pipeline: Pipeline, io: IO, conditional: boolean): Promise<number> {
     let status: number
     if (pipeline.commands.length === 1) {
       status = await this.runCommand(pipeline.commands[0], io)
@@ -136,7 +174,7 @@ export class Shell {
         const owned = [input !== io.stdin ? input : -1, last ? -1 : writeEnd].filter((fd) => fd >= 0)
         // Our copies of the pipe ends close once the stage has its own (or is done), so the next
         // stage sees EOF and the previous one EPIPE.
-        stages.push(this.runCommand(command, { stdin: input, stdout: writeEnd, stderr: io.stderr }, () => owned.forEach(sys.close)))
+        stages.push(this.runCommand(command, { ...io, stdin: input, stdout: writeEnd }, () => owned.forEach(sys.close)))
         input = readEnd
       }
       status = (await Promise.all(stages)).at(-1)!
@@ -231,7 +269,16 @@ export class Shell {
   async spawnAndWait(argv: string[], io: IO, env?: Map<string, string>, spawned?: () => void): Promise<number> {
     let pid: number
     try {
-      pid = sys.spawn(argv, { cwd: this.cwd, env: this.env(env), fds: [io.stdin, io.stdout, io.stderr] })
+      const job = io.job
+      pid = sys.spawn(argv, { cwd: this.cwd, env: this.env(env), fds: [io.stdin, io.stdout, io.stderr], pgid: job ? (job.pgid ?? 0) : undefined })
+      if (job && job.pgid === undefined) {
+        job.pgid = pid
+        try {
+          sys.tcsetpgrp(job.tty, pid)
+        } catch {
+          // No terminal to hand over.
+        }
+      }
     } catch (error) {
       // Report before releasing: stderr may be one of the fds being released.
       try {
@@ -253,6 +300,8 @@ export class Shell {
     const [code, signal] = await sys.waitStatus(pid)
     if (signal !== null) {
       if (signal !== 2 && SIGNALS[signal]) this.print(io.stderr, `${SIGNALS[signal]}\n`)
+      // The terminal echoed ^C; the prompt starts on a line of its own.
+      else if (signal === 2 && io.job) this.print(io.stderr, '\n')
       return 128 + signal
     }
     return code ?? 0
@@ -290,7 +339,7 @@ export class Shell {
       if (redirect.op === '&>' || redirect.op === '&>>') fds[1] = fds[2] = fd
       else fds[redirect.fd] = fd
     }
-    return { stdin: fds[0], stdout: fds[1], stderr: fds[2] }
+    return { stdin: fds[0], stdout: fds[1], stderr: fds[2], job: io.job }
   }
 
   // --- expansion -----------------------------------------------------------------------------

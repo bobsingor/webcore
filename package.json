@@ -10,6 +10,7 @@
     "build": "pnpm --filter @webcore/wat-bin build && pnpm --filter @webcore/node-lib build && pnpm --filter @webcore/userland build",
     "dev": "pnpm build && pnpm --parallel --filter @webcore/runtime --filter @webcore/playground dev",
     "test": "pnpm build && pnpm --filter @webcore/kernel test",
+    "test:node": "pnpm build && pnpm --filter @webcore/kernel test:node",
     "typecheck": "tsc -p tsconfig.json"
   },
   "devDependencies": {

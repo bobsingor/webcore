@@ -11,7 +11,8 @@
     "./vite": "./src/preview/vite.js"
   },
   "scripts": {
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:node": "node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/node-tests.ts"
   },
   "devDependencies": {
     "@webcore/node-lib": "workspace:*",
