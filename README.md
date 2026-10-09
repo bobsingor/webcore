@@ -15,7 +15,7 @@ browser's own JIT. Everything else runs as WebAssembly.
 Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design and roadmap, and
 [docs/adr/](docs/adr/README.md) for the decisions behind it.
 
-## Status: M1a, real Node.js ✅
+## Status: M1b, real Node.js with ES modules ✅
 
 `node` is **Node.js v24.21.0**: Node's own JavaScript standard library, unmodified, running on the
 browser's JavaScript engine over bindings written against the kernel. The bindings replace the C++
@@ -43,6 +43,9 @@ What works:
   - `fs` (sync, callbacks, promises, streams), `Buffer`, `URL`, `stream`, `events`, `util`
   - `child_process` (`spawn` with stdio pipes, `execFile`, `spawnSync`, `kill`)
   - Node-formatted errors
+  - ES modules: imports, live bindings, cycles, top-level await, `import.meta`, `import()`, JSON,
+    and CommonJS interop including `require(esm)` (ADR-0013). The real `create-vite` CLI
+    scaffolds a React app
   - 55 of 72 builtin modules load; the rest are scheduled (see [the M1 plan](docs/milestones/M1.md))
 - **WASI preview1:** args, env, preopens, files, directories, pipes, clocks, random, sleeps.
 - **Structured events:** spawn, exit and fs changes (ADR-0010).
@@ -113,7 +116,7 @@ The page must be cross-origin isolated (`Cross-Origin-Opener-Policy: same-origin
 
 ## Known limitations
 
-- **No ES modules yet** (M1b) and **no networking yet**: `net`, `http`, DNS (M1c).
+- **No networking yet**: `net`, `http`, DNS (M1c).
 - **No `crypto` or `zlib` yet**, and **no package installer or `sh` process** (M1d).
 - **No `fs.watch`, `worker_threads` or Wasm native addons** (M1e).
 - **The kernel runs on the page's main thread.** It moves into an isolated iframe in M1e (ADR-0009).

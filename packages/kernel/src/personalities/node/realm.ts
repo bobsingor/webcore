@@ -7,7 +7,8 @@ import type { SyscallClient } from '../../process/syscalls.ts'
 import { createBindings, type BindingFactory } from './bindings/index.ts'
 import type { Streams } from './bindings/streams.ts'
 import { selectMainScript, type CommandLine } from './cli.ts'
-import { compileFunction } from './compile.ts'
+import { compileFunction, compiledScripts } from './compile.ts'
+import { kEvaluationPhase, type Acorn } from './esm/transform.ts'
 import type { NodeLib } from './lib.ts'
 import { UvLoop } from './loop.ts'
 import { VERSIONS } from './versions.ts'
@@ -113,6 +114,11 @@ export class Realm {
   bufferPrototype?: object
   /** Handle classes shared by stream_wrap, pipe_wrap, tcp_wrap, tty_wrap and process_wrap. */
   streams?: Streams
+  /** Set by module_wrap.setImportModuleDynamicallyCallback / setInitializeImportMetaObjectCallback. */
+  importModuleDynamicallyCallback?: (referrer: unknown, specifier: string, phase: number, attributes: object, referrerName: string) => Promise<unknown>
+  initializeImportMetaCallback?: (referrer: unknown, meta: object, wrap: object) => void
+  private acornModule?: Acorn
+  private readonly importReferrers: [referrer: unknown, referrerName: string][] = []
   /**
    * The host's own web platform classes, captured before bootstrap installs Node's globals over
    * them. Overrides such as internal/deps/undici/undici re-export these.
@@ -146,6 +152,32 @@ export class Realm {
       this.bindingCache.set(name, binding)
     }
     return binding
+  }
+
+  /** Node's bundled acorn, used to compile ES modules and to find import() in scripts. */
+  get acorn(): Acorn {
+    return (this.acornModule ??= this.requireBuiltin('internal/deps/acorn/acorn/dist/acorn') as Acorn)
+  }
+
+  /** V8's HostImportModuleDynamically: hands import() to Node's loader. */
+  dynamicImport(referrer: unknown, specifier: unknown, options: unknown, referrerName: string): Promise<unknown> {
+    const callback = this.importModuleDynamicallyCallback
+    if (!callback) return Promise.reject(new Error('import() is not available'))
+    const attributes = (options as { with?: object } | undefined)?.with ?? {}
+    try {
+      return callback(referrer, String(specifier), kEvaluationPhase, attributes, referrerName)
+    } catch (error) {
+      return Promise.reject(error)
+    }
+  }
+
+  /**
+   * Scripts and CommonJS reach the loader through a global dispatcher, because their import()
+   * expressions can't see a local binding. Returns the replacement for `import(`.
+   */
+  importCallFor(referrer: unknown, referrerName: string): string {
+    this.importReferrers.push([referrer, referrerName])
+    return `${IMPORT_DISPATCHER}(${this.importReferrers.length - 1}, `
   }
 
   /** Turns bytes into a Buffer, as C++ does by giving a Uint8Array Buffer.prototype. */
@@ -190,6 +222,12 @@ export class Realm {
       this.compile(id)(this.process, this.requireBuiltin, this.internalBinding, primordials)
     }
     this.process.env = createEnvProxy(this.boot.env)
+    Object.defineProperty(globalThis, IMPORT_DISPATCHER, {
+      value: (id: number, specifier: unknown, options: unknown) => {
+        const [referrer, referrerName] = this.importReferrers[id]
+        return this.dynamicImport(referrer, specifier, options, referrerName)
+      },
+    })
     this.loop.emit = (name, ...args) => {
       const emit = this.process.emit
       if (typeof emit === 'function') emit.call(this.process, name, ...args)
@@ -227,6 +265,9 @@ export class Realm {
   }
 }
 
+/** Global used by import() in scripts and CommonJS (see Realm.importCallFor). */
+const IMPORT_DISPATCHER = '__webcore_import'
+
 const HOST_GLOBALS = [
   'fetch', 'FormData', 'Headers', 'Request', 'Response', 'WebSocket', 'EventSource', 'MessageEvent',
   'CloseEvent', 'URLPattern',
@@ -239,8 +280,8 @@ function captureHostGlobals(): Record<string, unknown> {
 
 /**
  * Stack traces come from Node's own formatter (V8 honours Error.prepareStackTrace). Frames from
- * webcore's implementation (http:, https:, file: or blob: URLs) are dropped; Node's builtins are
- * node: URLs and user code has plain file paths.
+ * webcore's own implementation are dropped: any URL script we didn't compile ourselves (Node's
+ * builtins are node: URLs, user code has file paths or file: URLs), plus generator plumbing.
  */
 function hideHostFrames(): void {
   const format = Error.prepareStackTrace
@@ -249,7 +290,9 @@ function hideHostFrames(): void {
   const scriptOf = (frame: NodeJS.CallSite) => frame.getScriptNameOrSourceURL?.() ?? frame.getFileName() ?? ''
   const isHostFrame = (frame: NodeJS.CallSite) => {
     const script = scriptOf(frame)
-    return /^(https?|file|blob):/.test(script) || (script === '' && (frame.isEval() || frame.getFunctionName() === 'eval'))
+    if (/^(https?|file|blob):/.test(script)) return !compiledScripts.has(script)
+    if (script !== '') return false
+    return frame.isEval() || frame.getFunctionName() === 'eval' || /^(Async)?Generator$/.test(frame.getTypeName() ?? '')
   }
   // V8 labels anonymous functions in source-compiled code "eval"; Node prints the bare location.
   const relabel = (frame: NodeJS.CallSite): NodeJS.CallSite => {

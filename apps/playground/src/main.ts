@@ -1,4 +1,4 @@
-import { createShell, DEFAULT_ENV, installRootfs, Kernel, runLine, type KernelEvent } from '@webcore/kernel'
+import { createShell, DEFAULT_ENV, installRootfs, installTarball, Kernel, runLine, type KernelEvent } from '@webcore/kernel'
 import { webProcessHost } from '@webcore/kernel/web'
 import nodeLibUrl from '@webcore/node-lib/node-lib.bin?url'
 import catUrl from '@webcore/wat-bin/cat.wasm?url'
@@ -7,7 +7,16 @@ import lsUrl from '@webcore/wat-bin/ls.wasm?url'
 import wcUrl from '@webcore/wat-bin/wc.wasm?url'
 import './style.css'
 
-const EXAMPLES = [
+const CREATE_VITE = 'https://registry.npmjs.org/create-vite/-/create-vite-9.2.1.tgz'
+
+interface Example {
+  label: string
+  command: string
+  /** Host-side setup before the command runs. */
+  prepare?: (kernel: Kernel) => Promise<void>
+}
+
+const EXAMPLES: Example[] = [
   { label: 'Real Node.js', command: `node -p "process.version + ' on ' + process.platform + ', ' + require('module').builtinModules.length + ' builtin modules'"` },
   {
     label: 'WASI → Node → WASI pipeline',
@@ -34,6 +43,26 @@ const EXAMPLES = [
     command: `node -e "setTimeout(() => console.log('timeout')); setImmediate(() => console.log('immediate')); process.nextTick(() => console.log('nextTick')); Promise.resolve().then(() => console.log('promise')); console.log('sync')"`,
   },
   { label: 'Uncaught error', command: `node -e "throw new Error('boom')"` },
+  {
+    label: 'ES modules',
+    command: `node --input-type=module -e "import { basename } from 'node:path'; const { readFileSync } = await import('node:fs'); console.log(basename(import.meta.url), readFileSync('/etc/hostname', 'utf8').trim())"`,
+  },
+  {
+    label: 'Scaffold a React app (create-vite)',
+    command: 'node /opt/create-vite/index.js my-app --template react --no-interactive --no-immediate && ls my-app/src',
+    // A preview of M1d: the real package, straight from the npm registry, unpacked into the VFS.
+    prepare: async (kernel) => {
+      try {
+        kernel.fs.lookup('/opt/create-vite/index.js')
+        return
+      } catch {
+        print(`fetching create-vite from the npm registry…\n`, 'meta')
+      }
+      const tarball = new Uint8Array(await (await fetch(CREATE_VITE)).arrayBuffer())
+      const count = await installTarball(kernel, tarball, '/opt/create-vite')
+      print(`unpacked ${count} files into /opt/create-vite\n`, 'meta')
+    },
+  },
 ]
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T
@@ -144,8 +173,9 @@ async function boot(): Promise<void> {
   for (const example of EXAMPLES) {
     const button = Object.assign(document.createElement('button'), { type: 'button', textContent: example.label })
     button.title = example.command
-    button.addEventListener('click', () => {
+    button.addEventListener('click', async () => {
       if (running) return
+      await example.prepare?.(kernel)
       input.value = example.command
       void submit()
     })

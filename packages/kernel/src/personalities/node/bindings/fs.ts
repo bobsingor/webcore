@@ -343,6 +343,27 @@ export function fsBindings() {
             const values = [0x01021994, 4096, 1 << 20, 1 << 19, 1 << 19, 1 << 20, 1 << 19, 0]
             return bigint ? BigInt64Array.from(values, BigInt) : Float64Array.from(values)
           }),
+        // The legacy "main" lookup of the ESM resolver: returns an index into
+        // legacyMainResolveExtensions (lib/internal/modules/esm/resolve.js).
+        legacyMainResolve: (packagePath: string, main: unknown, base: string | undefined) => {
+          const isFile = (path: string) => {
+            try {
+              return stat(path).type === 'file'
+            } catch {
+              return false
+            }
+          }
+          const join = (relative: string) => `${packagePath.replace(/\/$/, '')}/${relative.replace(/^\.\//, '')}`
+          if (typeof main === 'string') {
+            const candidates = ['', '.js', '.json', '.node', '/index.js', '/index.json', '/index.node']
+            const found = candidates.findIndex((suffix) => isFile(join(`${main}${suffix}`)))
+            if (found >= 0) return found
+          }
+          const found = ['index.js', 'index.json', 'index.node'].findIndex((file) => isFile(join(file)))
+          if (found >= 0) return 7 + found
+          const { ERR_MODULE_NOT_FOUND } = (realm.requireBuiltin('internal/errors') as { codes: Record<string, new (...args: unknown[]) => Error> }).codes
+          throw new ERR_MODULE_NOT_FOUND(packagePath, base)
+        },
         internalModuleStat: (path: unknown) => {
           try {
             return stat(pathOf(path)).type === 'dir' ? 1 : 0
@@ -568,7 +589,22 @@ export function fsBindings() {
         saveCompileCacheEntry: () => {},
         compileCacheStatus: ['FAILED', 'ENABLED', 'ALREADY_ENABLED', 'DISABLED'],
         cachedCodeTypes: { kStrippedTypeScript: 0, kTransformedTypeScript: 1, kTransformedTypeScriptWithSourceMaps: 2 },
-        setLazyPathHelpers: () => {},
+        // import.meta.filename / import.meta.dirname for file: URLs (lazy, like Node's C++).
+        setLazyPathHelpers: (meta: object, url: string) => {
+          const filename = () => decodeURIComponent(new host.URL(url).pathname)
+          const lazy = (key: string, compute: () => string) =>
+            Object.defineProperty(meta, key, {
+              configurable: true,
+              enumerable: true,
+              get() {
+                const value = compute()
+                Object.defineProperty(meta, key, { value, writable: true, configurable: true, enumerable: true })
+                return value
+              },
+            })
+          lazy('filename', filename)
+          lazy('dirname', () => filename().replace(/\/[^/]*$/, '') || '/')
+        },
       }
     },
   }

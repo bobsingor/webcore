@@ -12,6 +12,18 @@ const binaries = Object.fromEntries(
 const kernel = new Kernel({ host: nodeProcessHost() })
 kernel.addAsset('node-lib', new Uint8Array(readFileSync(new URL('node-lib/dist/node-lib.bin', root))))
 installRootfs(kernel, binaries)
+// WEBCORE_FIXTURE=<host dir> copies that directory into /home/user first.
+if (process.env.WEBCORE_FIXTURE) {
+  const copy = (from: string, to: string) => {
+    for (const entry of readdirSync(from, { withFileTypes: true })) {
+      if (entry.isDirectory()) {
+        kernel.fs.mkdirp(`${to}/${entry.name}`)
+        copy(`${from}/${entry.name}`, `${to}/${entry.name}`)
+      } else kernel.fs.writeFile(`${to}/${entry.name}`, new Uint8Array(readFileSync(`${from}/${entry.name}`)))
+    }
+  }
+  copy(process.env.WEBCORE_FIXTURE, '/home/user')
+}
 const env = { ...DEFAULT_ENV, PWD: '/home/user', ...Object.fromEntries(Object.entries(process.env).filter(([k]) => k.startsWith('WEBCORE_'))) }
 const lines = process.argv.length > 2 ? process.argv.slice(2) : ['node -e "console.log(1)"']
 for (const line of lines) {

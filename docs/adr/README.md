@@ -18,3 +18,4 @@ acceptance except to change their status. A decision is reversed by a new record
 | [0010](0010-structured-event-log.md) | Every kernel action emits a structured event | Accepted · basic events in M0 |
 | [0011](0011-environment-agnostic-core.md) | Kernel core is environment-agnostic (browser and headless) | Accepted · implemented in M0 |
 | [0012](0012-vendored-node-lib.md) | Vendor Node's `lib/` at a pinned LTS; ship it as one shared-memory bundle | Accepted · implemented in M1a |
+| [0013](0013-esm-generator-transform.md) | ES modules run as two-phase generators compiled from source | Accepted · implemented in M1b |

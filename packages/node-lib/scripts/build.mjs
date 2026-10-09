@@ -20,6 +20,7 @@ function walk(dir, toId) {
 
 walk(join(vendor, 'lib'), (path) => relative(join(vendor, 'lib'), path).replace(/\.js$/, ''))
 walk(join(vendor, 'deps'), (path) => `internal/deps/${relative(join(vendor, 'deps'), path).replace(/\.js$/, '')}`)
+sources.set('internal/deps/cjs-module-lexer/lexer', readFileSync(join(root, 'vendor/cjs-module-lexer/lexer.js'), 'utf8'))
 const overridden = []
 walk(join(root, 'overrides'), (path) => {
   const id = relative(join(root, 'overrides'), path).replace(/\.js$/, '')

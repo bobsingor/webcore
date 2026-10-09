@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 export const NODE_VERSION = 'v24.21.0'
+export const CJS_MODULE_LEXER_VERSION = '2.1.0'
 
 // The JavaScript that Node compiles into its binary: lib/ plus `deps_files` from node.gyp.
 const PATHS = [
@@ -47,3 +48,17 @@ rmSync(join(target, 'lib/eslint.config_partial.mjs'), { force: true })
 writeFileSync(join(target, 'VERSION'), `${NODE_VERSION}\n`)
 if (temporary) rmSync(temporary, { recursive: true, force: true })
 console.log(`vendored Node ${NODE_VERSION} into ${target}`)
+
+// Node ≥ 24 parses CommonJS exports in C++; the npm package's pure-JS lexer stands in for it.
+const npmTarget = new URL('../vendor/cjs-module-lexer/', import.meta.url).pathname
+const npmTemporary = mkdtempSync(join(tmpdir(), 'webcore-cjs-lexer-'))
+const tarball = join(npmTemporary, 'package.tgz')
+const response = await fetch(`https://registry.npmjs.org/cjs-module-lexer/-/cjs-module-lexer-${CJS_MODULE_LEXER_VERSION}.tgz`)
+if (!response.ok) throw new Error(`cjs-module-lexer download failed: ${response.status}`)
+writeFileSync(tarball, new Uint8Array(await response.arrayBuffer()))
+execFileSync('tar', ['-xzf', tarball, '-C', npmTemporary])
+rmSync(npmTarget, { recursive: true, force: true })
+for (const file of ['lexer.js', 'LICENSE']) cpSync(join(npmTemporary, 'package', file), join(npmTarget, file))
+writeFileSync(join(npmTarget, 'VERSION'), `${CJS_MODULE_LEXER_VERSION}\n`)
+rmSync(npmTemporary, { recursive: true, force: true })
+console.log(`vendored cjs-module-lexer ${CJS_MODULE_LEXER_VERSION} into ${npmTarget}`)
