@@ -4,13 +4,14 @@
 import { installRootfs, Kernel, PreviewBridge } from '@webcore/kernel'
 import { webProcessHost } from '@webcore/kernel/web'
 import nodeLibUrl from '@webcore/node-lib/node-lib.bin?url'
-import { previewOrigin, PROTOCOL_VERSION, RUNTIME_HELLO, RUNTIME_LOADED } from '@webcore/sdk/protocol'
+import { previewOrigin, PROTOCOL_VERSION, RUNTIME_HELLO, RUNTIME_LOADED, type RuntimeHello } from '@webcore/sdk/protocol'
 import userland from '@webcore/userland/userland.json'
 import catUrl from '@webcore/wat-bin/cat.wasm?url'
 import echoUrl from '@webcore/wat-bin/echo.wasm?url'
 import lsUrl from '@webcore/wat-bin/ls.wasm?url'
 import wcUrl from '@webcore/wat-bin/wc.wasm?url'
 import { serveRuntime } from './server.ts'
+import { openWorkspace } from './storage.ts'
 
 const NOT_ISOLATED =
   "The webcore runtime isn't cross-origin isolated, so it can't use SharedArrayBuffer. Its page must be " +
@@ -31,7 +32,7 @@ const loadAssets = () =>
     ).then((entries) => Object.fromEntries(entries)),
   ])
 
-async function start(port: MessagePort, assets: ReturnType<typeof loadAssets>): Promise<void> {
+async function start(port: MessagePort, hello: RuntimeHello, assets: ReturnType<typeof loadAssets>): Promise<void> {
   if (!crossOriginIsolated) {
     port.postMessage({ t: 'failed', message: NOT_ISOLATED })
     return
@@ -40,8 +41,10 @@ async function start(port: MessagePort, assets: ReturnType<typeof loadAssets>): 
     const [nodeLib, binaries] = await assets
     const kernel = new Kernel({ host: webProcessHost(), assets: { 'node-lib': nodeLib } })
     installRootfs(kernel, binaries, userland)
+    // /home comes back from the workspace's saved state, and is saved as it changes (M2b).
+    const workspace = hello.workspace === null ? undefined : await openWorkspace(kernel, hello.workspace || 'default', hello.from)
     const bridge = new PreviewBridge(kernel, { origin: (number) => previewOrigin(PREVIEW_ORIGIN, number) })
-    serveRuntime(kernel, port, { previewOrigin: PREVIEW_ORIGIN, previews: bridge })
+    serveRuntime(kernel, port, { previewOrigin: PREVIEW_ORIGIN, previews: bridge, workspace })
   } catch (error) {
     port.postMessage({ t: 'failed', message: `The webcore runtime failed to start: ${error instanceof Error ? error.message : String(error)}` })
   }
@@ -58,7 +61,7 @@ if (window.parent === window) {
   addEventListener('message', (event) => {
     if (connected || event.source !== window.parent || event.data?.type !== RUNTIME_HELLO || !event.ports[0]) return
     connected = true
-    void start(event.ports[0], assets)
+    void start(event.ports[0], event.data as RuntimeHello, assets)
   })
   window.parent.postMessage({ type: RUNTIME_LOADED, protocol: PROTOCOL_VERSION }, '*')
 }

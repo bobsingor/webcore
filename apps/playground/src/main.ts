@@ -8,6 +8,33 @@ import './style.css'
 // VITE_WEBCORE_RUNTIME points elsewhere.
 const RUNTIME_URL = import.meta.env.VITE_WEBCORE_RUNTIME ?? `${location.protocol}//webcore.localhost:5190/`
 
+// /home is saved in a workspace (M2b): ?workspace=<name> picks one, ?from=<snapshot> starts it there.
+const params = new URLSearchParams(location.search)
+const WORKSPACE = params.get('workspace') || 'playground'
+const FROM = params.get('from') ?? undefined
+let lastSnapshot: string | undefined
+
+async function takeSnapshot(runtime: Runtime): Promise<string> {
+  lastSnapshot = await runtime.snapshot()
+  return `Snapshot of /home: ${lastSnapshot.slice(0, 12)}…`
+}
+
+async function restoreSnapshot(runtime: Runtime): Promise<string> {
+  if (!lastSnapshot) return 'Take a snapshot first.'
+  await runtime.restore(lastSnapshot)
+  return `Restored /home to ${lastSnapshot.slice(0, 12)}…`
+}
+
+/** A fork is a new workspace that starts from a snapshot of this one; here, in another tab. */
+async function forkInNewTab(runtime: Runtime): Promise<string> {
+  const snapshot = await runtime.snapshot()
+  const url = new URL(location.href)
+  url.searchParams.set('workspace', `fork-${Math.random().toString(36).slice(2, 8)}`)
+  url.searchParams.set('from', snapshot)
+  window.open(url, '_blank')
+  return `Forked ${WORKSPACE} at ${snapshot.slice(0, 12)}… into a new tab.`
+}
+
 // The "HTTP server" example: a page plus a JSON endpoint it polls.
 const SERVER_JS = `const http = require('node:http')
 
@@ -132,6 +159,9 @@ const EXAMPLES: Example[] = [
     command: '',
     action: editApp,
   },
+  { label: 'Snapshot /home', command: '', action: takeSnapshot },
+  { label: 'Restore snapshot', command: '', action: restoreSnapshot },
+  { label: 'Fork in a new tab', command: '', action: forkInNewTab },
   {
     label: 'worker_threads',
     command: `node -e "const { Worker } = require('worker_threads'); const body = () => { const t = require('worker_threads'); t.parentPort.postMessage('hello from thread ' + t.threadId) }; new Worker('(' + body + ')()', { eval: true }).on('message', console.log)"`,
@@ -168,6 +198,12 @@ function describeEvent(event: RuntimeEvent): string {
       return `net    pid ${event.pid}  listening on ${event.address}:${event.port}`
     case 'net.close':
       return `net    pid ${event.pid}  closed port ${event.port}`
+    case 'fs.snapshot':
+      return `snap   ${event.path} → ${event.hash.slice(0, 12)}`
+    case 'fs.restore':
+      return `restore ${event.path} ← ${event.hash.slice(0, 12)}`
+    case 'workspace.save':
+      return `saved  workspace ${event.name} → ${event.head.slice(0, 12)}`
   }
 }
 
@@ -236,7 +272,7 @@ function setupPreview(runtime: Runtime): void {
   })
 }
 
-const READY = `ready · runtime on ${new URL(RUNTIME_URL).host}`
+let READY = `ready · runtime on ${new URL(RUNTIME_URL).host}`
 
 /**
  * The terminal: xterm.js on a pseudo-terminal in the runtime (M2a), running a login shell. When
@@ -284,7 +320,9 @@ async function boot(): Promise<void> {
   setStatus('starting runtime…', 'booting')
   let runtime: Runtime
   try {
-    runtime = await connect({ url: RUNTIME_URL })
+    runtime = await connect({ url: RUNTIME_URL, workspace: WORKSPACE, from: FROM })
+    // A forked tab keeps its own workspace from here on; reloading shouldn't fork again.
+    if (FROM) history.replaceState(null, '', `?workspace=${encodeURIComponent(WORKSPACE)}`)
   } catch (error) {
     setStatus('runtime unavailable', 'error')
     $<HTMLDivElement>('term').textContent = `Could not start the webcore runtime at ${RUNTIME_URL}: ${(error as Error).message}`
@@ -293,7 +331,17 @@ async function boot(): Promise<void> {
   runtime.events.subscribe(logEvent)
   setupPreview(runtime)
   const terminal = setupTerminal(runtime)
+  const workspace = runtime.info.workspace
+  READY = !workspace
+    ? `ready · in memory only`
+    : workspace.writable
+      ? `ready · workspace ${workspace.name}`
+      : `ready · workspace ${workspace.name} (open in another tab: not saving)`
   setStatus(READY, 'ready')
+  runtime.events.subscribe((event) => {
+    if (event.type !== 'workspace.save') return
+    setStatus(`${READY} · saved ${new Date(event.time).toLocaleTimeString()}`, 'ready')
+  })
 
   const examples = $<HTMLDivElement>('examples')
   let notice: ReturnType<typeof setTimeout> | undefined

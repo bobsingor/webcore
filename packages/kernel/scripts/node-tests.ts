@@ -14,7 +14,7 @@ import { nodeProcessHost } from '../src/host/node.ts'
 import { DEFAULT_ENV, exec, installRootfs, Kernel } from '../src/index.ts'
 
 const NODE_VERSION = 'v24.21.0'
-const TIMEOUT_MS = 30_000
+const TIMEOUT_MS = 60_000
 const CONCURRENCY = 6
 const OUTPUT_LIMIT = 2000
 

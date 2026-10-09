@@ -99,6 +99,21 @@ describe('runtime processes', () => {
   })
 })
 
+describe('runtime snapshots', () => {
+  it('snapshots and restores /home', async () => {
+    await runtime.fs.writeFile('/home/user/notes.txt', 'first')
+    const snapshot = await runtime.snapshot()
+    expect(snapshot).toMatch(/^[0-9a-f]{64}$/)
+    await runtime.fs.writeFile('/home/user/notes.txt', 'second')
+    await runtime.fs.writeFile('/home/user/extra.txt', 'extra')
+    await runtime.restore(snapshot)
+    expect(await runtime.fs.readFile('/home/user/notes.txt', 'utf8')).toBe('first')
+    await expect(runtime.fs.stat('/home/user/extra.txt')).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(runtime.restore('0'.repeat(64))).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(runtime.info.workspace).toBeNull()
+  })
+})
+
 describe('runtime terminals', () => {
   it('runs programs on a terminal, with keystrokes, resizes and hang-up', async () => {
     let screen = ''

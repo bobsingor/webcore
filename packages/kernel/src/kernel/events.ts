@@ -8,6 +8,12 @@ export type KernelEventBody =
   | { type: 'fs.change'; op: FsOp; path: string; to?: string }
   | { type: 'net.listen'; pid: number; port: number; address: string }
   | { type: 'net.close'; pid: number; port: number }
+  /** A directory was hashed into the object store (ADR-0007). */
+  | { type: 'fs.snapshot'; path: string; hash: string }
+  /** A directory was replaced by a snapshot; fs.change events for the differences follow. */
+  | { type: 'fs.restore'; path: string; hash: string }
+  /** A workspace's state reached persistent storage (host/workspace.ts). */
+  | { type: 'workspace.save'; name: string; head: string }
 
 export type KernelEvent = KernelEventBody & { seq: number; time: number }
 

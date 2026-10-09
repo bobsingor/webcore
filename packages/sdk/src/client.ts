@@ -114,6 +114,9 @@ export interface RuntimeEvents {
   subscribe(listener: (event: RuntimeEvent) => void): () => void
 }
 
+/** Starts a runtime in `workspace` from snapshot `from` (connect() provides it). */
+type Forker = (from: string, workspace: string) => Promise<Runtime>
+
 interface Job {
   onOutput(fd: 1 | 2, data: Uint8Array): void
   onExit?(code: number): void
@@ -136,9 +139,11 @@ export class Runtime {
   #jobs = new Map<number, Job>()
   #listeners = new Set<(event: RuntimeEvent) => void>()
   #closed = false
+  #fork?: Forker
 
   /** Use connect() in a page, or openRuntime() with a port. */
-  constructor(port: PortLike, info: RuntimeInfo, onClose: () => void = () => {}) {
+  constructor(port: PortLike, info: RuntimeInfo, onClose: () => void = () => {}, fork?: Forker) {
+    this.#fork = fork
     this.#port = port
     this.info = info
     this.#onClose = onClose
@@ -281,6 +286,28 @@ export class Runtime {
     }
   }
 
+  /**
+   * Snapshots /home (ADR-0007) and returns its hash. Unchanged files aren't hashed again, and
+   * identical contents are stored once. In a persistent workspace the snapshot is saved, and kept.
+   */
+  snapshot(): Promise<string> {
+    return this.#call('snapshot', [])
+  }
+
+  /** Replaces /home with a snapshot. Watchers (dev servers) see the files that differ change. */
+  restore(snapshot: string): Promise<void> {
+    return this.#call('restore', [snapshot])
+  }
+
+  /**
+   * Starts a second runtime from a snapshot of this one's /home, in a workspace of its own: try
+   * something there, and keep or drop it. Needs a runtime from connect().
+   */
+  async fork(workspace = `fork-${Math.random().toString(36).slice(2, 10)}`): Promise<Runtime> {
+    if (!this.#fork) throw new RuntimeError('fork() needs a runtime started with connect()')
+    return this.#fork(await this.snapshot(), workspace)
+  }
+
   /** The URL to load in an iframe to preview `path` on `port` (ADR-0014). */
   previewUrl(port: number, path = '/'): string {
     return `${previewOrigin(this.info.previewOrigin, port)}${PREVIEW_BOOT_PATH}?path=${encodeURIComponent(path)}`
@@ -364,14 +391,17 @@ function toError(error: RemoteError): RuntimeError {
 }
 
 /** Waits for the runtime on `port` to report that it booted. */
-export function openRuntime(port: PortLike, options: { timeout?: number; onClose?: () => void } = {}): Promise<Runtime> {
+export function openRuntime(
+  port: PortLike,
+  options: { timeout?: number; onClose?: () => void; fork?: Forker } = {},
+): Promise<Runtime> {
   const timeout = options.timeout ?? 30_000
   return new Promise((resolve, reject) => {
     const onMessage = (event: MessageEvent) => {
       const message = event.data as RuntimeMessage
       if (message?.t === 'ready') {
         cleanup()
-        resolve(new Runtime(port, message.info, options.onClose))
+        resolve(new Runtime(port, message.info, options.onClose, options.fork))
       } else if (message?.t === 'failed') {
         cleanup()
         reject(new RuntimeError(message.message))

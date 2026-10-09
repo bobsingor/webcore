@@ -13,6 +13,7 @@ import {
   type Process,
   type PtyMaster,
   type Shell,
+  type Workspace,
 } from '@webcore/kernel'
 import {
   PROTOCOL_VERSION,
@@ -31,6 +32,8 @@ import {
 export interface ServeOptions {
   /** Preview origins, with `{port}` for the port (RuntimeInfo.previewOrigin). */
   previewOrigin: string
+  /** The persistent workspace for /home, if any (M2b). */
+  workspace?: Workspace
   /** Serves a preview page's channel, for the port it previews: the PreviewBridge. */
   previews?: { serve(channel: MessagePort, port: number): void }
 }
@@ -108,6 +111,13 @@ export function serveRuntime(kernel: Kernel, port: PortLike, options: ServeOptio
       } finally {
         jobs.delete(job)
       }
+    },
+
+    snapshot: () => (options.workspace ? options.workspace.snapshot() : kernel.snapshot('/home')),
+    restore: (hash) => {
+      if (typeof hash !== 'string' || !/^[0-9a-f]{64}$/.test(hash)) throw new KernelError(Errno.EINVAL, 'not a snapshot hash')
+      if (!kernel.store.has(hash)) throw new KernelError(Errno.ENOENT, `no snapshot ${hash}`)
+      return kernel.restore(hash, '/home')
     },
 
     events: (enabled) => {
@@ -241,7 +251,8 @@ export function serveRuntime(kernel: Kernel, port: PortLike, options: ServeOptio
     }
   })
   port.start()
-  send({ t: 'ready', info: { protocol: PROTOCOL_VERSION, previewOrigin: options.previewOrigin } })
+  const workspace = options.workspace ? { name: options.workspace.name, writable: options.workspace.writable } : null
+  send({ t: 'ready', info: { protocol: PROTOCOL_VERSION, previewOrigin: options.previewOrigin, workspace } })
 }
 
 function absolute(path: string): string {

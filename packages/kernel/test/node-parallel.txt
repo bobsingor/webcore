@@ -1597,7 +1597,6 @@ test-process-release.js
 test-process-remove-all-signal-listeners.js
 test-process-setsourcemapsenabled.js
 test-process-threadCpuUsage-main-thread.js
-test-process-threadCpuUsage-worker-threads.js
 test-process-umask-mask.js
 test-process-umask.js
 test-process-uncaught-exception-monitor.js

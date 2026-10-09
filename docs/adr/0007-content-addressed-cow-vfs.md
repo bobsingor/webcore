@@ -1,6 +1,6 @@
 # 0007. Content-addressed, copy-on-write VFS; snapshots are tree hashes
 
-- **Status:** Accepted (M0 uses a plain memfs behind the same interface)
+- **Status:** Accepted · implemented in M2b: blobs, trees and copy-on-write restore, persisted by workspaces ([0019](0019-workspaces.md)); lazy-HTTP mounts come with M3
 - **Date:** 2026-10-09
 
 ## Context

@@ -2,7 +2,8 @@
 // (ADR-0009, ADR-0017). Two window messages set up one MessagePort; everything else travels on it.
 //
 //   runtime → parent   { type: 'webcore:runtime-loaded' }       its listener is installed
-//   parent → runtime   { type: 'webcore:runtime-hello' } + port  accepted once, from the parent only
+//   parent → runtime   { type: 'webcore:runtime-hello', workspace, from } + port
+//                      accepted once, from the parent only
 //   runtime → port     { t: 'ready', info } or { t: 'failed', message }
 //
 // Calls are request/response by id. Output of jobs (processes and shell lines) streams separately,
@@ -15,10 +16,21 @@ export const RUNTIME_HELLO = 'webcore:runtime-hello'
 /** The page that installs a preview's Service Worker (ADR-0014). */
 export const PREVIEW_BOOT_PATH = '/__webcore/boot.html'
 
+export interface RuntimeHello {
+  type: typeof RUNTIME_HELLO
+  protocol: number
+  /** The workspace whose /home this runtime loads and saves; null keeps everything in memory. */
+  workspace: string | null
+  /** Start from this snapshot instead of the workspace's own state (a fork). */
+  from?: string
+}
+
 export interface RuntimeInfo {
   protocol: number
   /** Preview origins, with `{port}` for the port: `http://p{port}.localhost:5190`. */
   previewOrigin: string
+  /** The persistent workspace, if any. Not writable when another tab already writes it. */
+  workspace: { name: string; writable: boolean } | null
 }
 
 export type FileType = 'file' | 'dir' | 'chardev' | 'fifo' | 'socket' | 'symlink'
@@ -49,6 +61,9 @@ export type RuntimeEvent = (
   | { type: 'fs.change'; op: FsOp; path: string; to?: string }
   | { type: 'net.listen'; pid: number; port: number; address: string }
   | { type: 'net.close'; pid: number; port: number }
+  | { type: 'fs.snapshot'; path: string; hash: string }
+  | { type: 'fs.restore'; path: string; hash: string }
+  | { type: 'workspace.save'; name: string; head: string }
 ) & { seq: number; time: number }
 
 export interface SpawnRequestOptions {
@@ -82,6 +97,10 @@ export interface Methods {
   'shell.run': [[job: number, session: number, line: string], { code: number } & ShellState]
   /** Turns forwarding of kernel events on or off. */
   events: [[enabled: boolean], void]
+  /** Snapshots /home (saved, and kept by compaction); returns its hash (ADR-0007). */
+  snapshot: [[], string]
+  /** Replaces /home with a snapshot. */
+  restore: [[hash: string], void]
 }
 
 export type Method = keyof Methods

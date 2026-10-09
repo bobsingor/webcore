@@ -15,7 +15,7 @@ browser's own JIT. Everything else runs as WebAssembly.
 Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design and roadmap, and
 [docs/adr/](docs/adr/README.md) for the decisions behind it.
 
-## Status: M2a, terminal ✅
+## Status: M2b, state ✅
 
 `node` is **Node.js v24.21.0**: Node's own JavaScript standard library, unmodified, running on the
 browser's JavaScript engine over bindings written against the kernel. The bindings replace the C++
@@ -27,7 +27,9 @@ its worker threads), the React app renders in the preview pane, and edits update
 The kernel runs in an iframe on its own, cross-origin-isolated origin. Pages embed it with
 `@webcore/sdk` and need no special headers in Chromium (ADR-0009, ADR-0017). The playground's
 terminal is xterm.js on a kernel pseudo-terminal, running an interactive shell with job control:
-Ctrl+C reaches the foreground job, and `node` starts Node's REPL (ADR-0018).
+Ctrl+C reaches the foreground job, and `node` starts Node's REPL (ADR-0018). `/home` is saved as it
+changes and comes back after a reload, `node_modules` included. Snapshots, restores and forks take
+milliseconds (ADR-0007, ADR-0019).
 
 ```sh
 user@webcore:~$ node -p "process.version + ' on ' + process.platform"
@@ -41,7 +43,9 @@ What works:
 
 - **Kernel:**
   - processes, fd tables, pipes with blocking reads, backpressure, EOF and EPIPE
-  - an in-memory VFS, `spawn`/`wait`/`kill`
+  - a content-addressed, copy-on-write VFS: snapshots are tree hashes, restores share the stored
+    data until a file is written, and identical files are stored once (ADR-0007)
+  - `spawn`/`wait`/`kill`
   - signals with per-process dispositions: default actions, ignored, or delivered to handlers
     (ADR-0018)
   - pseudo-terminals with Linux's line discipline (editing, echo, `^C`, raw mode, window size),
@@ -84,7 +88,10 @@ What works:
 - **Preview:** a server listening on a port is served in an iframe on `p<port>.localhost`, through a
   Service Worker and a bridge to the kernel. Page requests, cookies and WebSockets work (ADR-0014).
 - **WASI preview1:** args, env, preopens, files, directories, pipes, clocks, random, sleeps.
-- **Structured events:** spawn, exit, fs changes, and ports opening and closing (ADR-0010).
+- **Workspaces** (ADR-0019): `/home` saved to the runtime origin's storage (OPFS) a moment after it
+  changes, restored on the next load, and forkable. One tab writes a workspace; others read it.
+- **Structured events:** spawn, exit, fs changes, snapshots and saves, and ports opening and closing
+  (ADR-0010).
 - **Isolation** (ADR-0017): the runtime frame isolates itself with Document-Isolation-Policy, and
   the embedding page reaches it through one MessagePort, with an async API for files, processes,
   shell sessions, events and previews.
@@ -122,7 +129,7 @@ pnpm test:node
 ```
 
 `pnpm test:node` runs Node's own `test/parallel` files listed in
-`packages/kernel/test/node-parallel.txt`: the 2,746 of 4,543 that pass (or skip) on webcore today. The tests are fetched
+`packages/kernel/test/node-parallel.txt`: the 2,745 of 4,543 that pass (or skip) on webcore today. The tests are fetched
 into a cache on first use. Add `--all` to run every file, and `--update` to refresh the list.
 
 ```bash
@@ -138,10 +145,11 @@ docs/
 packages/
   kernel/                @webcore/kernel
     src/abi/             syscall surface, errno, flags, wire protocol, syscall page
-    src/kernel/          Kernel, processes, VFS, pipes, open files, exec resolution, events
+    src/kernel/          Kernel, processes, VFS and snapshots, pipes, PTYs, open files, exec, events
     src/process/         Worker entries (browser, Node) and the process-side syscall client
     src/personalities/   wasi/ (WASI preview1), node/ (Node.js: realm, event loop, bindings)
-    src/host/            ProcessHosts, exec/pipeline helpers, mini shell, root filesystem, HTTP client
+    src/host/            ProcessHosts, exec/pipeline helpers, mini shell, root filesystem, HTTP client,
+                         workspaces
     src/lib/             environment-free libraries (the HTTP/1.1 parser)
     src/preview/         preview bridge, Service Worker, client script, Vite plugin (ADR-0014)
     test/                unit + end-to-end tests
@@ -162,10 +170,15 @@ returns an async API (ADR-0017):
 ```ts
 import { connect } from '@webcore/sdk'
 
-const runtime = await connect({ url: 'https://runtime.example.dev/' }) // a @webcore/runtime deployment
+// A @webcore/runtime deployment; /home is saved in workspace 'my-project' and back on the next load
+const runtime = await connect({ url: 'https://runtime.example.dev/', workspace: 'my-project' })
 
 await runtime.fs.writeFile('/home/user/hello.js', 'console.log(6 * 7)')
 const { code, stdout } = await runtime.exec(['node', 'hello.js'])
+
+const before = await runtime.snapshot() // a tree hash, in milliseconds
+const experiment = await runtime.fork() // a second runtime, from that snapshot, in its own workspace
+await runtime.restore(before) // back to how /home was
 
 const shell = await runtime.createShell() // keeps cd and export between lines
 await shell.run('npm create vite@latest app -- --template react --no-interactive', { onStdout: (chunk) => log(chunk) })
@@ -222,8 +235,9 @@ const { code, stdout } = await exec(kernel, ['node', '-p', '6 * 7'], { env: { ..
   (ADR-0017). They haven't been tested.
 - **There is no hosted runtime yet.** `connect()` needs the URL of a `@webcore/runtime` deployment.
 - **Background tabs are slow.** Browsers throttle hidden pages, and every process feels it.
-- **The VFS is in-memory and mutable.** The content-addressed copy-on-write store comes in M2
-  (ADR-0007).
+- **Workspaces stay in the browser.** They're per embedding site, aren't synced across devices, and
+  can be evicted under storage pressure. Snapshots don't keep hard links or times. Lazy mounts for
+  large runtime images come with Python in M3.
 - **Signals can't interrupt running code.** A handler runs once the program yields; default actions
   still end the process at once. There's no stop/continue yet, so no `^Z`, `bg` or `fg` (M2c).
 - **The shell is webcore's own `sh`**, a POSIX subset with a few file utilities built in. bash,

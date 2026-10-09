@@ -1,5 +1,6 @@
-// In-memory filesystem. M0 keeps it mutable and path-based; ADR-0007's content-addressed,
-// copy-on-write store replaces the storage behind this same interface in M2.
+// In-memory filesystem, with the hooks ADR-0007's content-addressed store needs (snapshot.ts):
+// nodes cache the hash of what they hold until they change, and file data restored from a
+// snapshot is shared with the object store until the first write copies it.
 import { Errno, KernelError, kerr } from '../abi/errno.ts'
 import { S_IFCHR, S_IFDIR, S_IFLNK, S_IFREG } from '../abi/constants.ts'
 import type { Dirent, Stat } from '../abi/constants.ts'
@@ -24,11 +25,18 @@ export interface FileNode extends NodeBase {
   version: number
   /** Hard links to this file. */
   nlink: number
+  /** The blob hash of the contents, until they change. */
+  hash?: string
+  /** `data` is an object store blob: copied before the first write (copy-on-write). */
+  shared?: boolean
 }
 
 export interface DirNode extends NodeBase {
   kind: 'dir'
   children: Map<string, VNode>
+  /** The tree hash of the listing it had when last hashed, and that listing (snapshot.ts). */
+  hash?: string
+  tree?: string
 }
 
 export interface DevNode extends NodeBase {
@@ -39,6 +47,8 @@ export interface DevNode extends NodeBase {
 export interface SymlinkNode extends NodeBase {
   kind: 'symlink'
   target: string
+  /** The blob hash of the target. */
+  hash?: string
 }
 
 export type VNode = FileNode | DirNode | DevNode | SymlinkNode
@@ -231,6 +241,7 @@ export class MemFS {
 
   static writeAt(node: FileNode, position: number, data: Uint8Array): void {
     const end = position + data.length
+    if (node.shared) MemFS.unshare(node, end)
     if (end > node.data.length) {
       const grown = new Uint8Array(Math.max(end, node.data.length * 2, 64))
       grown.set(node.data.subarray(0, node.size))
@@ -242,6 +253,7 @@ export class MemFS {
   }
 
   static truncate(node: FileNode, length: number): void {
+    if (node.shared) MemFS.unshare(node, length)
     if (length < node.size) node.data.fill(0, length, node.size)
     else if (length > node.data.length) {
       const grown = new Uint8Array(length)
@@ -254,7 +266,34 @@ export class MemFS {
 
   private static modified(node: FileNode): void {
     node.version++
+    node.hash = undefined
     node.mtimeMs = node.ctimeMs = Date.now()
+  }
+
+  /** Copy-on-write: a file restored from a snapshot gets its own buffer before it changes. */
+  private static unshare(node: FileNode, capacity: number): void {
+    const own = new Uint8Array(Math.max(capacity, node.size, 64))
+    own.set(node.data.subarray(0, node.size))
+    node.data = own
+    node.shared = false
+  }
+
+  /**
+   * Puts `node` (a whole tree) at `path` in place of what is there now, as restoring a snapshot
+   * does. The parent must exist. Returns the node it replaced.
+   */
+  replace(path: string, node: VNode): VNode | undefined {
+    const parent = this.parentDir(path)
+    const name = basename(path)
+    const previous = parent.children.get(name)
+    parent.children.set(name, node)
+    this.touch(parent)
+    return previous
+  }
+
+  /** A fresh inode number and times, for nodes built outside (snapshot.ts). */
+  newNode(mode: number): NodeBase {
+    return this.base(mode)
   }
 
   /**

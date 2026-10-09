@@ -44,6 +44,8 @@ import { DeviceHandle, DirHandle, FileHandle, PipeReader, PipeWriter, type OpenF
 import { dirname, normalize, resolve } from './path.ts'
 import { Pipe } from './pipe.ts'
 import { Pty, PtyMaster, PtySlave, ptyOf } from './pty.ts'
+import { diffTrees, materialize, snapshotTree } from './snapshot.ts'
+import { MemoryStore } from './store.ts'
 import { Process, type Channel, type Thread, type WorkerLike } from './process.ts'
 import { MemFS, type FileNode } from './vfs.ts'
 
@@ -59,6 +61,8 @@ export interface KernelOptions {
   pageBytes?: number
   /** Read-only assets shared with every process (see addAsset). */
   assets?: Record<string, Uint8Array>
+  /** Where snapshots keep their objects (ADR-0007). By default, memory. */
+  store?: MemoryStore
 }
 
 export interface SpawnOptions {
@@ -98,6 +102,8 @@ export class Kernel {
   readonly events = new EventBus()
   /** Virtual TCP: listening ports and connections (ADR-0014). */
   readonly net = new Network(this.events)
+  /** Snapshot objects: blobs and trees by hash (ADR-0007). */
+  readonly store: MemoryStore
   private readonly host: ProcessHost
   private readonly pageBytes: number
   private readonly procs = new Map<number, Process>()
@@ -109,6 +115,7 @@ export class Kernel {
   private nextPty = 0
 
   constructor(options: KernelOptions) {
+    this.store = options.store ?? new MemoryStore()
     this.host = options.host
     this.pageBytes = options.pageBytes ?? DEFAULT_PAGE_BYTES
     for (const [name, bytes] of Object.entries(options.assets ?? {})) this.addAsset(name, bytes)
@@ -262,6 +269,35 @@ export class Kernel {
     }
     this.fs.rmdir(target)
     this.events.emit({ type: 'fs.change', op: 'rmdir', path: target })
+  }
+
+  /**
+   * Snapshots the directory at `path` (ADR-0007): returns its tree hash. Only what changed since
+   * the last snapshot is hashed, and the objects stay in `store`.
+   */
+  async snapshot(path = '/home'): Promise<string> {
+    const target = normalize(path)
+    const node = this.fs.lookup(target)
+    if (node.kind !== 'dir') throw kerr('ENOTDIR', target)
+    const hash = await snapshotTree(this.store, node)
+    this.events.emit({ type: 'fs.snapshot', path: target, hash })
+    return hash
+  }
+
+  /**
+   * Replaces the directory at `path` with snapshot `hash`, whose objects must be in `store`. The
+   * new tree shares the stored data until files are written (copy-on-write). Watchers get an
+   * fs.change event for each difference, so dev servers see restored files.
+   */
+  async restore(hash: string, path = '/home'): Promise<void> {
+    const target = normalize(path)
+    const current = this.fs.tryLookup(target, false)
+    if (current && current.kind !== 'dir') throw kerr('ENOTDIR', target)
+    const before = current ? await snapshotTree(this.store, current) : undefined
+    const tree = materialize(this.fs, this.store, hash, current?.mode ?? 0o755)
+    this.fs.replace(target, tree)
+    this.events.emit({ type: 'fs.restore', path: target, hash })
+    diffTrees(this.store, before, hash, target, (op, changed) => this.events.emit({ type: 'fs.change', op, path: changed }))
   }
 
   /** Renames from outside any process. */

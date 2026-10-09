@@ -3,7 +3,7 @@
 // kernel events and previews, all as async calls over one MessagePort. Code running in webcore
 // never shares an origin, or a process, with the embedding page.
 import { openRuntime, Runtime, RuntimeError } from './client.ts'
-import { PROTOCOL_VERSION, RUNTIME_HELLO, RUNTIME_LOADED } from './protocol.ts'
+import { PROTOCOL_VERSION, RUNTIME_HELLO, RUNTIME_LOADED, type RuntimeHello } from './protocol.ts'
 
 export { openRuntime, Runtime, RuntimeError } from './client.ts'
 export type {
@@ -27,6 +27,13 @@ export interface ConnectOptions {
   container?: HTMLElement
   /** How long to wait for the runtime to load and boot, in milliseconds. Default: 30 s. */
   timeout?: number
+  /**
+   * The workspace whose /home the runtime loads and keeps saving (M2b), in the runtime origin's
+   * storage. Default: 'default'. null keeps everything in memory, gone when the page goes.
+   */
+  workspace?: string | null
+  /** Start from this snapshot instead of the workspace's saved state. */
+  from?: string
 }
 
 /** Starts a runtime and connects to it. Each call gets its own runtime, with its own kernel. */
@@ -77,8 +84,10 @@ export async function connect(options: ConnectOptions): Promise<Runtime> {
         removeEventListener('message', relay)
         frame.remove()
       },
+      fork: (from, workspace) => connect({ ...options, workspace, from }),
     })
-    frame.contentWindow!.postMessage({ type: RUNTIME_HELLO, protocol: PROTOCOL_VERSION }, url.origin, [port2])
+    const hello: RuntimeHello = { type: RUNTIME_HELLO, protocol: PROTOCOL_VERSION, workspace: options.workspace === undefined ? 'default' : options.workspace, from: options.from }
+    frame.contentWindow!.postMessage(hello, url.origin, [port2])
     runtime = await opening
   } catch (error) {
     frame.remove()
