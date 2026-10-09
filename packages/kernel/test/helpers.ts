@@ -6,6 +6,7 @@ import { createShell, DEFAULT_ENV, installRootfs, Kernel, runLine, type Shell } 
 
 const require = createRequire(import.meta.url)
 const binDir = join(dirname(require.resolve('@webcore/wat-bin/package.json')), 'dist')
+const nodeLib = new Uint8Array(readFileSync(join(dirname(require.resolve('@webcore/node-lib/package.json')), 'dist/node-lib.bin')))
 
 export const binaries: Record<string, Uint8Array> = Object.fromEntries(
   readdirSync(binDir)
@@ -14,7 +15,7 @@ export const binaries: Record<string, Uint8Array> = Object.fromEntries(
 )
 
 export function boot(): Kernel {
-  const kernel = new Kernel({ host: nodeProcessHost() })
+  const kernel = new Kernel({ host: nodeProcessHost(), assets: { 'node-lib': nodeLib } })
   installRootfs(kernel, binaries)
   return kernel
 }

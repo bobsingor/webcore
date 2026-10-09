@@ -177,7 +177,7 @@ Each milestone has a concrete exit criterion.
 | # | Milestone | Exit criterion |
 |---|---|---|
 | **M0** | **Kernel spike** (this repo, now) | A JS process and a WASI binary pipe into each other through synchronous syscalls, in the browser and headless in Node |
-| M1 | Flagship | `npm create vite` → `npm install` → `npm run dev` with a live preview |
+| M1 | Flagship ([plan](milestones/M1.md)) | `npm create vite` → `npm install` → `npm run dev` with a live preview |
 | M2 | Shell and state | bash/BusyBox via WASIX, PTY + xterm.js, CoW VFS with snapshot/restore |
 | M3 | Second runtime | Python + PGlite on the same kernel (forces the kernel to stay language-neutral) |
 | M4 | Agents | Host SDK + MCP server, headless package, public compatibility dashboard |

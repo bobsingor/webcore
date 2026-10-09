@@ -1,0 +1,16 @@
+{
+  "name": "@webcore/node-lib",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Node.js's own JavaScript standard library (lib/), vendored at a pinned LTS and bundled for webcore (ADR-0012).",
+  "type": "module",
+  "exports": {
+    "./node-lib.bin": "./dist/node-lib.bin",
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "vendor": "node scripts/vendor.mjs",
+    "build": "node scripts/build.mjs",
+    "scan": "node scripts/scan-bindings.mjs"
+  }
+}

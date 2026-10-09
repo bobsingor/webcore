@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@webcore/kernel": "workspace:*",
+    "@webcore/node-lib": "workspace:*",
     "@webcore/wat-bin": "workspace:*"
   },
   "devDependencies": {

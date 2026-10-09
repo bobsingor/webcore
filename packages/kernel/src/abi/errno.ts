@@ -36,6 +36,7 @@ export const Errno = {
   ENOSYS: 38,
   ENOTEMPTY: 39,
   ELOOP: 40,
+  ENOBUFS: 105,
   EOVERFLOW: 75,
 } as const
 

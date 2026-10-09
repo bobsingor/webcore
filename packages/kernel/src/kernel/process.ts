@@ -19,6 +19,8 @@ export class Process {
   cwd: string
   state: ProcessState = 'starting'
   exitCode: number | null = null
+  /** Set when the process was terminated by a signal rather than exiting. */
+  termSignal: number | null = null
   /** Resolves with the exit code. */
   readonly exited: Promise<number>
   /** Aborted on exit; cancels the process's pending blocking operations. */

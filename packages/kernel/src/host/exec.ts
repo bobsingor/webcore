@@ -102,7 +102,7 @@ export async function pipeline(kernel: Kernel, commands: Command[], options: Exe
   for (const file of held) file.release()
 
   options.signal?.addEventListener('abort', () => {
-    for (const proc of procs) if (proc) kernel.kill(proc.pid, 130)
+    for (const proc of procs) if (proc) kernel.kill(proc.pid, 2)
   })
 
   const [stdout, stderr, codes] = await Promise.all([

@@ -7,9 +7,9 @@
     "node": ">=22.6"
   },
   "scripts": {
-    "build:wasm": "pnpm --filter @webcore/wat-bin build",
-    "dev": "pnpm build:wasm && pnpm --filter @webcore/playground dev",
-    "test": "pnpm build:wasm && pnpm --filter @webcore/kernel test",
+    "build": "pnpm --filter @webcore/wat-bin build && pnpm --filter @webcore/node-lib build",
+    "dev": "pnpm build && pnpm --filter @webcore/playground dev",
+    "test": "pnpm build && pnpm --filter @webcore/kernel test",
     "typecheck": "tsc -p tsconfig.json"
   },
   "devDependencies": {

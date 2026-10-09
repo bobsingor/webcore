@@ -11,10 +11,15 @@ self.addEventListener(
           error.preventDefault()
           handler(error.error ?? new Error(error.message))
         })
-        self.addEventListener('unhandledrejection', (rejection) => {
-          rejection.preventDefault()
-          handler(rejection.reason)
+      },
+      onUnhandledRejection(handler) {
+        self.addEventListener('unhandledrejection', (event) => {
+          event.preventDefault()
+          handler(event.reason, event.promise)
         })
+      },
+      onRejectionHandled(handler) {
+        self.addEventListener('rejectionhandled', (event) => handler(event.promise))
       },
     }),
   { once: true },

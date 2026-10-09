@@ -1,5 +1,25 @@
 import type { Dirent, Stat } from './constants.ts'
 
+export interface SpawnSyncRequest {
+  cwd?: string
+  env?: Record<string, string>
+  /** Per stdio slot: 'pipe' (captured, or fed from `input` for fd 0), 'ignore', or a caller fd. */
+  stdio: ('pipe' | 'ignore' | number)[]
+  input?: Uint8Array
+  /** Milliseconds; the child is killed with `killSignal` when exceeded. */
+  timeout?: number
+  killSignal?: number
+  /** Bytes per captured stream before the child is killed (ENOBUFS). */
+  maxBuffer?: number
+}
+
+/**
+ * spawnSync's result, packed as bytes: an Int32 header [pid, status, signal, errno, stdoutLength,
+ * stderrLength] followed by stdout and stderr. status is -1 when the child died from a signal;
+ * errno is non-zero when the child couldn't be started or exceeded maxBuffer.
+ */
+export const SPAWN_SYNC_HEADER_BYTES = 24
+
 export interface SpawnRequest {
   /** Working directory for the child; defaults to the caller's. */
   cwd?: string
@@ -33,6 +53,12 @@ export interface Syscalls {
   pipe(): [number, number]
   spawn(argv: string[], request?: SpawnRequest): number
   wait(pid: number): number
+  /** Signal 0 checks that the process exists; any other signal terminates it with 128 + signal. */
+  kill(pid: number, signal: number): number
+  /** Like wait, but distinguishes exit codes from signals: [code, signal] (one of them is null). */
+  waitStatus(pid: number): [code: number | null, signal: number | null]
+  /** Runs a child to completion, inside the kernel (see SPAWN_SYNC_HEADER_BYTES). */
+  spawnSync(argv: string[], request: SpawnSyncRequest): Uint8Array
 }
 
 export type SyscallName = keyof Syscalls

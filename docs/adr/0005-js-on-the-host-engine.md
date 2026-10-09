@@ -1,6 +1,6 @@
 # 0005. JavaScript runs on the host engine; Node built from Node's own `lib/`
 
-- **Status:** Accepted · minimal shim in M0, real `lib/` in M1
+- **Status:** Accepted · implemented in M1a (Node v24.21.0's `lib/` over TypeScript bindings)
 - **Date:** 2026-10-09
 
 ## Context

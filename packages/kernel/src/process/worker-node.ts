@@ -9,7 +9,12 @@ parentPort!.once('message', (boot: BootMessage) =>
   startProcess(boot, {
     onUncaughtError(handler) {
       nodeProcess.on('uncaughtException', handler)
-      nodeProcess.on('unhandledRejection', handler)
+    },
+    onUnhandledRejection(handler) {
+      nodeProcess.on('unhandledRejection', (reason, promise) => handler(reason, promise as Promise<unknown>))
+    },
+    onRejectionHandled(handler) {
+      nodeProcess.on('rejectionHandled', (promise) => handler(promise as Promise<unknown>))
     },
   }),
 )

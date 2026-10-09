@@ -1,5 +1,6 @@
 import { createShell, DEFAULT_ENV, installRootfs, Kernel, runLine, type KernelEvent } from '@webcore/kernel'
 import { webProcessHost } from '@webcore/kernel/web'
+import nodeLibUrl from '@webcore/node-lib/node-lib.bin?url'
 import catUrl from '@webcore/wat-bin/cat.wasm?url'
 import echoUrl from '@webcore/wat-bin/echo.wasm?url'
 import lsUrl from '@webcore/wat-bin/ls.wasm?url'
@@ -7,9 +8,14 @@ import wcUrl from '@webcore/wat-bin/wc.wasm?url'
 import './style.css'
 
 const EXAMPLES = [
+  { label: 'Real Node.js', command: `node -p "process.version + ' on ' + process.platform + ', ' + require('module').builtinModules.length + ' builtin modules'"` },
   {
-    label: 'WASI → JS → WASI pipeline',
+    label: 'WASI → Node → WASI pipeline',
     command: `echo hello webcore | node -e "process.stdin.on('data', d => process.stdout.write(d.toString().toUpperCase()))" | wc`,
+  },
+  {
+    label: 'Node spawns a WASI child',
+    command: `node -e "const c = require('child_process').spawn('wc'); c.stdout.pipe(process.stdout); c.stdin.end('one two three\\n')"`,
   },
   { label: 'Read a file (WASI)', command: 'cat /etc/motd' },
   { label: 'List a directory (WASI)', command: 'ls /usr/bin' },
@@ -23,6 +29,11 @@ const EXAMPLES = [
   },
   { label: 'Exit codes', command: `node -e "process.exit(42)"; echo "exit status: $?"` },
   { label: 'Event loop + timers', command: `node -e "let n = 3; const t = setInterval(() => { console.log('tick', n); if (!--n) clearInterval(t) }, 300)"` },
+  {
+    label: 'Event loop phases',
+    command: `node -e "setTimeout(() => console.log('timeout')); setImmediate(() => console.log('immediate')); process.nextTick(() => console.log('nextTick')); Promise.resolve().then(() => console.log('promise')); console.log('sync')"`,
+  },
+  { label: 'Uncaught error', command: `node -e "throw new Error('boom')"` },
 ]
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T
@@ -118,12 +129,14 @@ async function boot(): Promise<void> {
     print(`${(error as Error).message}\n`, 'err')
     return
   }
+  const download = async (url: string) => new Uint8Array(await (await fetch(url)).arrayBuffer())
   const urls = { cat: catUrl, echo: echoUrl, ls: lsUrl, wc: wcUrl }
-  const binaries = Object.fromEntries(
-    await Promise.all(
-      Object.entries(urls).map(async ([name, url]) => [name, new Uint8Array(await (await fetch(url)).arrayBuffer())]),
-    ),
-  )
+  const [nodeLib, binaries] = await Promise.all([
+    download(nodeLibUrl),
+    Promise.all(Object.entries(urls).map(async ([name, url]) => [name, await download(url)])).then(Object.fromEntries),
+  ])
+  // Node's standard library, shared with every Node process (ADR-0012).
+  kernel.addAsset('node-lib', nodeLib)
   installRootfs(kernel, binaries)
   kernel.events.subscribe(logEvent)
 

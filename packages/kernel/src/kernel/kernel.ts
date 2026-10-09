@@ -12,7 +12,8 @@ import {
 } from '../abi/constants.ts'
 import { completeSync, createPage, DEFAULT_PAGE_BYTES, pageCapacity } from '../abi/page.ts'
 import type { BootMessage, SyscallReply, SyscallRequest } from '../abi/protocol.ts'
-import type { SyscallArgs, SyscallName, SyscallReturn, SyscallValue } from '../abi/syscalls.ts'
+import { SPAWN_SYNC_HEADER_BYTES } from '../abi/syscalls.ts'
+import type { SpawnSyncRequest, SyscallArgs, SyscallName, SyscallReturn, SyscallValue } from '../abi/syscalls.ts'
 import { EventBus } from './events.ts'
 import { resolveExecutable, type Executable } from './exec.ts'
 import { DeviceHandle, DirHandle, FileHandle, PipeReader, PipeWriter, type OpenFile } from './files.ts'
@@ -31,6 +32,8 @@ export interface KernelOptions {
   host: ProcessHost
   /** Payload bytes in each process's syscall page. Bounds a single read. */
   pageBytes?: number
+  /** Read-only assets shared with every process (see addAsset). */
+  assets?: Record<string, Uint8Array>
 }
 
 export interface SpawnOptions {
@@ -63,11 +66,27 @@ export class Kernel {
   private readonly pageBytes: number
   private readonly procs = new Map<number, Process>()
   private readonly modules = new WeakMap<FileNode, { version: number; module: Promise<WebAssembly.Module> }>()
+  private readonly assets: Record<string, Uint8Array> = {}
   private nextPid = 1
 
   constructor(options: KernelOptions) {
     this.host = options.host
     this.pageBytes = options.pageBytes ?? DEFAULT_PAGE_BYTES
+    for (const [name, bytes] of Object.entries(options.assets ?? {})) this.addAsset(name, bytes)
+  }
+
+  /**
+   * Registers read-only data shared with every process, such as the Node standard library. It is
+   * copied once into shared memory, so passing it to each new Worker costs nothing.
+   */
+  addAsset(name: string, bytes: Uint8Array): void {
+    const shared = new Uint8Array(new SharedArrayBuffer(bytes.byteLength))
+    shared.set(bytes)
+    this.assets[name] = shared
+  }
+
+  hasAsset(name: string): boolean {
+    return Object.hasOwn(this.assets, name)
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -113,13 +132,14 @@ export class Kernel {
     return [...this.procs.values()]
   }
 
-  kill(pid: number, code = 137): void {
+  /** Terminates a process as if by `signal` (SIGKILL by default): exit status 128 + signal. */
+  kill(pid: number, signal = 9): void {
     const proc = this.procs.get(pid)
-    if (proc) this.terminate(proc, code)
+    if (proc) this.terminate(proc, 128 + signal, signal)
   }
 
   shutdown(): void {
-    for (const proc of [...this.procs.values()]) this.terminate(proc, 137)
+    for (const proc of [...this.procs.values()]) this.terminate(proc, 137, 9)
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -145,6 +165,7 @@ export class Kernel {
         execPath: exe.path,
         personality: exe.personality,
         module,
+        assets: this.assets,
         page,
         port: port2,
       }
@@ -176,8 +197,9 @@ export class Kernel {
     this.terminate(proc, 1)
   }
 
-  private terminate(proc: Process, code: number): void {
+  private terminate(proc: Process, code: number, signal: number | null = null): void {
     if (proc.state === 'exited') return
+    proc.termSignal = signal
     proc.markExited(code & 0xff)
     proc.closeAll()
     proc.port?.close()
@@ -313,6 +335,23 @@ export class Kernel {
       return this.spawn(argv, { cwd, env: request.env ?? proc.env, stdio, ppid: proc.pid }).pid
     },
 
+    kill: (_proc, pid, signal) => {
+      const target = this.procs.get(pid)
+      if (!target || !target.alive) throw kerr('ESRCH')
+      if (signal !== 0) this.terminate(target, 128 + (signal | 0), signal | 0)
+      return 0
+    },
+
+    waitStatus: async (proc, pid) => {
+      const child = this.procs.get(pid)
+      if (!child || child.ppid !== proc.pid) throw kerr('ECHILD')
+      const code = await child.exited
+      this.procs.delete(pid)
+      return child.termSignal === null ? [code, null] : [null, child.termSignal]
+    },
+
+    spawnSync: (proc, argv, request) => this.spawnSync(proc, argv, request),
+
     wait: async (proc, pid) => {
       const child = this.procs.get(pid)
       if (!child || child.ppid !== proc.pid) throw kerr('ECHILD')
@@ -320,6 +359,85 @@ export class Kernel {
       this.procs.delete(pid)
       return code
     },
+  }
+
+  /** spawnSync, run entirely inside the kernel so the blocked caller can't deadlock on pipes. */
+  private async spawnSync(proc: Process, argv: string[], request: SpawnSyncRequest): Promise<Uint8Array> {
+    const capacity = pageCapacity(proc.page!) - SPAWN_SYNC_HEADER_BYTES
+    const maxBuffer = Math.min(request.maxBuffer ?? capacity, capacity)
+    const held: OpenFile[] = []
+    const captured: (Promise<Uint8Array> | undefined)[] = [undefined, undefined, undefined]
+    let overflow = false
+    let child: Process | undefined
+    const stdio = [0, 1, 2].map((fd) => {
+      const mode = request.stdio[fd] ?? 'pipe'
+      if (mode === 'ignore') return undefined
+      if (typeof mode === 'number') return proc.getFd(mode)
+      const [reader, writer] = this.pipe()
+      held.push(reader, writer)
+      if (fd === 0) {
+        Promise.resolve(writer.write(request.input ?? new Uint8Array(0)))
+          .catch(() => {})
+          .finally(() => writer.release())
+        held.splice(held.indexOf(writer), 1)
+        return reader
+      }
+      captured[fd] = (async () => {
+        const chunks: Uint8Array[] = []
+        let total = 0
+        for (let chunk = await reader.read(64 * 1024); chunk.length; chunk = await reader.read(64 * 1024)) {
+          total += chunk.length
+          if (total > maxBuffer) {
+            overflow = true
+            if (child) this.terminate(child, 128 + (request.killSignal ?? 15), request.killSignal ?? 15)
+            break
+          }
+          chunks.push(chunk)
+        }
+        const out = new Uint8Array(chunks.reduce((sum, chunk) => sum + chunk.length, 0))
+        let offset = 0
+        for (const chunk of chunks) {
+          out.set(chunk, offset)
+          offset += chunk.length
+        }
+        return out
+      })()
+      return writer
+    })
+
+    const header = new Int32Array(SPAWN_SYNC_HEADER_BYTES / 4)
+    try {
+      const cwd = request.cwd === undefined ? proc.cwd : this.resolveAt(proc, AT_FDCWD, request.cwd)
+      child = this.spawn(argv, { cwd, env: request.env ?? proc.env, stdio, ppid: proc.pid })
+    } catch (error) {
+      for (const file of held) file.release()
+      header[3] = error instanceof KernelError ? error.errno : Errno.EIO
+      return new Uint8Array(header.buffer)
+    }
+    // The child holds its own references now; ours would keep its pipes from reaching EOF.
+    for (const file of held) if (file instanceof PipeWriter) file.release()
+
+    const timer =
+      request.timeout && request.timeout > 0
+        ? setTimeout(() => this.terminate(child!, 128 + (request.killSignal ?? 15), request.killSignal ?? 15), request.timeout)
+        : undefined
+    const code = await child.exited
+    if (timer !== undefined) clearTimeout(timer)
+    const [stdout = new Uint8Array(0), stderr = new Uint8Array(0)] = await Promise.all([captured[1], captured[2]])
+    for (const file of held) if (file instanceof PipeReader) file.release()
+    this.procs.delete(child.pid)
+
+    header[0] = child.pid
+    header[1] = child.termSignal === null ? code : -1
+    header[2] = child.termSignal ?? 0
+    header[3] = overflow ? Errno.ENOBUFS : 0
+    header[4] = stdout.length
+    header[5] = stderr.length
+    const out = new Uint8Array(SPAWN_SYNC_HEADER_BYTES + stdout.length + stderr.length)
+    out.set(new Uint8Array(header.buffer))
+    out.set(stdout, SPAWN_SYNC_HEADER_BYTES)
+    out.set(stderr, SPAWN_SYNC_HEADER_BYTES + stdout.length)
+    return out
   }
 
   private resolveAt(proc: Process, dirfd: number, path: string): string {
