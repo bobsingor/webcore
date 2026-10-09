@@ -1,0 +1,14 @@
+{
+  "name": "@webcore/userland",
+  "version": "0.0.0",
+  "private": true,
+  "description": "webcore's own programs, written in TypeScript for its Node.js: sh, and npm/npx (a package installer).",
+  "type": "module",
+  "exports": {
+    "./userland.json": "./dist/userland.json",
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build": "node --disable-warning=ExperimentalWarning scripts/build.mjs"
+  }
+}

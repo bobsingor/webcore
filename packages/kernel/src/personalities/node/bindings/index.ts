@@ -2,6 +2,7 @@
 // (see trace.ts), and every implemented binding reports accesses to properties it lacks.
 import type { Realm } from '../realm.ts'
 import { childBindings } from './child.ts'
+import { cryptoBindings } from './crypto.ts'
 import { encodingBindings } from './encoding.ts'
 import { fsBindings } from './fs.ts'
 import { httpBindings } from './http.ts'
@@ -10,6 +11,7 @@ import { processBindings } from './process.ts'
 import { streamBindings } from './streams.ts'
 import { supportBindings } from './support.ts'
 import { urlBinding } from './url.ts'
+import { zlibBindings } from './zlib.ts'
 
 export type BindingFactory = (realm: Realm) => object
 
@@ -23,6 +25,8 @@ export function createBindings(): Record<string, BindingFactory> {
     ...childBindings(),
     ...streamBindings(),
     ...httpBindings(),
+    ...zlibBindings(),
+    ...cryptoBindings(),
     url: urlBinding,
   }
 }

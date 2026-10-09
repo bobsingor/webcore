@@ -89,6 +89,12 @@ export class UvLoop {
     this.queueAliveCheck()
   }
 
+  /** Counts `promise` as a pending request until it settles. */
+  track<T>(promise: Promise<T>): Promise<T> {
+    this.requestStarted()
+    return promise.finally(() => this.requestFinished())
+  }
+
   isAlive(): boolean {
     return (
       this.handles > 0 ||

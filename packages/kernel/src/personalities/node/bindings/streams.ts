@@ -25,6 +25,7 @@ const UV_ENOTCONN = -107
 const UV_EAI_NONAME = -3008
 const READ_CHUNK = 64 * 1024
 const DNS_ORDER_IPV6_FIRST = 2
+const kProcessFlagDetached = 1
 
 type Request = { oncomplete?: (...args: unknown[]) => void; handle?: unknown }
 
@@ -456,7 +457,14 @@ export function createStreams(realm: Realm) {
     pid = 0
     onexit?: (this: Process, exitCode: number, signalCode: string) => void
 
-    spawn(file: string, args: string[], cwd: string | null | undefined, envPairs: string[] | undefined, stdio: StdioOption[]): number {
+    spawn(
+      file: string,
+      args: string[],
+      cwd: string | null | undefined,
+      envPairs: string[] | undefined,
+      stdio: StdioOption[],
+      flags = 0,
+    ): number {
       // execFile defaults cwd to null, meaning "inherit".
       const options = { file, args, cwd: cwd ?? undefined, envPairs, stdio }
       const fds: [number, number, number] = [-1, -1, -1]
@@ -483,6 +491,7 @@ export function createStreams(realm: Realm) {
           cwd: options.cwd,
           env: envFromPairs(options.envPairs),
           fds,
+          detached: (flags & kProcessFlagDetached) !== 0,
         })
       } catch (error) {
         for (const fd of [...childEnds, ...parentEnds]) sys.call('close', fd)

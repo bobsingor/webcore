@@ -2,7 +2,7 @@
 // src/personalities/node/esm.
 import { readFileSync } from 'node:fs'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { installTarball, type Kernel } from '../src/index.ts'
+import type { Kernel } from '../src/index.ts'
 import { boot, sh } from './helpers.ts'
 
 let kernel: Kernel
@@ -172,7 +172,7 @@ describe('errors', () => {
 describe('M1b acceptance', () => {
   it('runs create-vite to scaffold a React app', async () => {
     const tarball = new Uint8Array(readFileSync(new URL('./fixtures/create-vite-9.2.1.tgz', import.meta.url)))
-    expect(await installTarball(kernel, tarball, '/opt/create-vite')).toBeGreaterThan(50)
+    expect(await kernel.extract(tarball, '/opt/create-vite', { strip: 1 })).toBeGreaterThan(50)
 
     const result = await sh(kernel, 'node /opt/create-vite/index.js my-app --template react --no-interactive --no-immediate')
     expect(result.code).toBe(0)

@@ -11,6 +11,7 @@
   "dependencies": {
     "@webcore/kernel": "workspace:*",
     "@webcore/node-lib": "workspace:*",
+    "@webcore/userland": "workspace:*",
     "@webcore/wat-bin": "workspace:*"
   },
   "devDependencies": {

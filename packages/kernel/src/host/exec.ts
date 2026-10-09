@@ -68,6 +68,8 @@ export async function pipeline(kernel: Kernel, commands: Command[], options: Exe
 
   const procs: (Process | undefined)[] = []
   const failed: number[] = []
+  // A pipeline is one job: one process group, led by its first process.
+  let pgid: number | undefined
   commands.forEach((command, index) => {
     const last = index === commands.length - 1
     let input = stdin
@@ -90,7 +92,9 @@ export async function pipeline(kernel: Kernel, commands: Command[], options: Exe
       return
     }
     try {
-      procs.push(kernel.spawn(command.argv, { cwd, env: options.env, stdio: [input, output, stderrWrite] }))
+      const proc = kernel.spawn(command.argv, { cwd, env: options.env, stdio: [input, output, stderrWrite], pgid })
+      pgid ??= proc.pid
+      procs.push(proc)
     } catch (error) {
       const notFound = error instanceof KernelError && error.errno === Errno.ENOENT
       report(`sh: ${command.argv[0]}: ${notFound ? 'command not found' : describe(error)}\n`)
@@ -101,8 +105,9 @@ export async function pipeline(kernel: Kernel, commands: Command[], options: Exe
   // The children hold their own references; dropping ours lets EOF propagate.
   for (const file of held) file.release()
 
+  // Ctrl+C reaches the whole job, including children the commands started (npm → sh → vite).
   options.signal?.addEventListener('abort', () => {
-    for (const proc of procs) if (proc) kernel.kill(proc.pid, 2)
+    if (pgid !== undefined) kernel.killGroup(pgid, 2)
   })
 
   const [stdout, stderr, codes] = await Promise.all([

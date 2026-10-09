@@ -2,6 +2,7 @@
 // primordials, private symbols, builtin compilation and the bootstrap order
 // (src/node_realm.cc, src/api/environment.cc, src/node_builtins.cc, src/builtin_info.h).
 import type { BootMessage } from '../../abi/protocol.ts'
+import type { SyscallName } from '../../abi/syscalls.ts'
 import type { Platform } from '../../process/main.ts'
 import type { SyscallClient } from '../../process/syscalls.ts'
 import { createBindings, type BindingFactory } from './bindings/index.ts'
@@ -138,7 +139,7 @@ export class Realm {
     for (const name of PRIVATE_SYMBOLS) this.privateSymbols[name] = Symbol(`node:${name}`)
     for (const name of PER_ISOLATE_SYMBOLS) this.perIsolateSymbols[name] = Symbol(name)
     this.factories = createBindings()
-    this.hostGlobals = captureHostGlobals()
+    this.hostGlobals = captureHostGlobals(this.loop)
     this.process = this.createProcessObject()
     this.loop.process = this.process
   }
@@ -261,6 +262,16 @@ export class Realm {
     readonly(process, 'release', release)
     const encoder = new host.TextEncoder()
     process._rawDebug = (message: unknown) => this.sys.call('write', 2, encoder.encode(`${String(message)}\n`))
+    // The kernel ABI, for webcore's own JavaScript programs (sh, npm). Not enumerable, so Node code
+    // inspecting `process` sees what it expects.
+    const sys = this.sys
+    Object.defineProperty(process, 'webcore', {
+      value: Object.freeze({
+        syscall: (name: SyscallName, ...args: unknown[]) => sys.call(name, ...(args as never)),
+        syscallAsync: (name: SyscallName, ...args: unknown[]) => this.loop.track(sys.callAsync(name, ...(args as never))),
+      }),
+      enumerable: false,
+    })
     return process
   }
 }
@@ -273,9 +284,31 @@ const HOST_GLOBALS = [
   'CloseEvent', 'URLPattern',
 ]
 
-function captureHostGlobals(): Record<string, unknown> {
+function captureHostGlobals(loop: UvLoop): Record<string, unknown> {
   const host = globalThis as unknown as Record<string, unknown>
-  return Object.fromEntries(HOST_GLOBALS.map((name) => [name, host[name]]))
+  const globals = Object.fromEntries(HOST_GLOBALS.map((name) => [name, host[name]]))
+  // A pending request keeps a Node process alive (undici's sockets do in real Node). The host's
+  // fetch settles outside the event loop's view, so the loop is told about it and about body reads.
+  const fetch = globals.fetch as typeof globalThis.fetch | undefined
+  if (fetch) globals.fetch = (...args: Parameters<typeof globalThis.fetch>) => loop.track(fetch(...args))
+  const trackMethods = (proto: object | undefined, names: string[]) => {
+    for (const name of names) {
+      const original = proto && (proto as Record<string, unknown>)[name]
+      if (typeof original !== 'function') continue
+      Object.defineProperty(proto, name, {
+        value: function (this: unknown, ...args: unknown[]) {
+          return loop.track(original.apply(this, args) as Promise<unknown>)
+        },
+        writable: true,
+        configurable: true,
+      })
+    }
+  }
+  const BODY_METHODS = ['arrayBuffer', 'blob', 'bytes', 'formData', 'json', 'text']
+  trackMethods((globals.Response as { prototype?: object } | undefined)?.prototype, BODY_METHODS)
+  trackMethods((globals.Request as { prototype?: object } | undefined)?.prototype, BODY_METHODS)
+  trackMethods((host.ReadableStreamDefaultReader as { prototype?: object } | undefined)?.prototype, ['read'])
+  return globals
 }
 
 /**

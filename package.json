@@ -4,10 +4,10 @@
   "type": "module",
   "packageManager": "pnpm@10.34.0",
   "engines": {
-    "node": ">=22.6"
+    "node": ">=22.13"
   },
   "scripts": {
-    "build": "pnpm --filter @webcore/wat-bin build && pnpm --filter @webcore/node-lib build",
+    "build": "pnpm --filter @webcore/wat-bin build && pnpm --filter @webcore/node-lib build && pnpm --filter @webcore/userland build",
     "dev": "pnpm build && pnpm --filter @webcore/playground dev",
     "test": "pnpm build && pnpm --filter @webcore/kernel test",
     "typecheck": "tsc -p tsconfig.json"

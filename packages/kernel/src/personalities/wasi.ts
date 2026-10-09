@@ -61,12 +61,13 @@ const LINUX_TO_WASI = new Map<number, number>([
   [Errno.EXDEV, 75],
 ])
 
-const FILETYPE: Record<FileType, number> = { chardev: 2, dir: 3, file: 4, fifo: 0, socket: 6 }
+const FILETYPE: Record<FileType, number> = { chardev: 2, dir: 3, file: 4, fifo: 0, socket: 6, symlink: 7 }
 
 const RIGHT_FD_READ = 1n << 1n
 const RIGHT_FD_WRITE = 1n << 6n
 const ALL_RIGHTS = 0x1fffffffn
 
+const LOOKUP_SYMLINK_FOLLOW = 1
 const OFLAG_CREAT = 1
 const OFLAG_DIRECTORY = 2
 const OFLAG_EXCL = 4
@@ -319,8 +320,21 @@ export function runWasi(boot: BootMessage, sys: SyscallClient): never {
         view().setUint32(fdPtr, fd, true)
       }),
 
-    path_filestat_get: (dirfd: number, _flags: number, pathPtr: number, pathLen: number, ptr: number) =>
-      guard(() => writeFilestat(ptr, sys.call('stat', readString(pathPtr, pathLen), dirfd))),
+    path_filestat_get: (dirfd: number, flags: number, pathPtr: number, pathLen: number, ptr: number) =>
+      guard(() => {
+        const path = readString(pathPtr, pathLen)
+        writeFilestat(ptr, flags & LOOKUP_SYMLINK_FOLLOW ? sys.call('stat', path, dirfd) : sys.call('lstat', path, dirfd))
+      }),
+    path_readlink: (dirfd: number, pathPtr: number, pathLen: number, buf: number, bufLen: number, bufusedPtr: number) =>
+      guard(() => {
+        const target = encoder.encode(sys.call('readlink', readString(pathPtr, pathLen), dirfd)).subarray(0, bufLen)
+        bytes().set(target, buf)
+        view().setUint32(bufusedPtr, target.length, true)
+      }),
+    path_symlink: (targetPtr: number, targetLen: number, dirfd: number, pathPtr: number, pathLen: number) =>
+      guard(() => sys.call('symlink', readString(targetPtr, targetLen), readString(pathPtr, pathLen), dirfd)),
+    path_link: (fromFd: number, _flags: number, fromPtr: number, fromLen: number, toFd: number, toPtr: number, toLen: number) =>
+      guard(() => sys.call('link', readString(fromPtr, fromLen), readString(toPtr, toLen), fromFd, toFd)),
     path_filestat_set_times: () => SUCCESS,
     path_create_directory: (dirfd: number, pathPtr: number, pathLen: number) =>
       guard(() => sys.call('mkdir', readString(pathPtr, pathLen), 0o777, dirfd)),

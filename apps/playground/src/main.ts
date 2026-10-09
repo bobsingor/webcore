@@ -2,7 +2,6 @@ import {
   createShell,
   DEFAULT_ENV,
   installRootfs,
-  installTarball,
   Kernel,
   PreviewBridge,
   previewPortOf,
@@ -11,13 +10,12 @@ import {
 } from '@webcore/kernel'
 import { webProcessHost } from '@webcore/kernel/web'
 import nodeLibUrl from '@webcore/node-lib/node-lib.bin?url'
+import userland from '@webcore/userland/userland.json'
 import catUrl from '@webcore/wat-bin/cat.wasm?url'
 import echoUrl from '@webcore/wat-bin/echo.wasm?url'
 import lsUrl from '@webcore/wat-bin/ls.wasm?url'
 import wcUrl from '@webcore/wat-bin/wc.wasm?url'
 import './style.css'
-
-const CREATE_VITE = 'https://registry.npmjs.org/create-vite/-/create-vite-9.2.1.tgz'
 
 // The "HTTP server" example: a page plus a JSON endpoint it polls.
 const SERVER_JS = `const http = require('node:http')
@@ -112,20 +110,12 @@ const EXAMPLES: Example[] = [
     command: `node --input-type=module -e "import { basename } from 'node:path'; const { readFileSync } = await import('node:fs'); console.log(basename(import.meta.url), readFileSync('/etc/hostname', 'utf8').trim())"`,
   },
   {
-    label: 'Scaffold a React app (create-vite)',
-    command: 'node /opt/create-vite/index.js my-app --template react --no-interactive --no-immediate && ls my-app/src',
-    // A preview of M1d: the real package, straight from the npm registry, unpacked into the VFS.
-    prepare: async (kernel) => {
-      try {
-        kernel.fs.lookup('/opt/create-vite/index.js')
-        return
-      } catch {
-        print(`fetching create-vite from the npm registry…\n`, 'meta')
-      }
-      const tarball = new Uint8Array(await (await fetch(CREATE_VITE)).arrayBuffer())
-      const count = await installTarball(kernel, tarball, '/opt/create-vite')
-      print(`unpacked ${count} files into /opt/create-vite\n`, 'meta')
-    },
+    label: 'npm create vite (React)',
+    command: 'npm create vite@latest my-app -- --template react',
+  },
+  {
+    label: 'npm install',
+    command: 'cd my-app && npm install',
   },
 ]
 
@@ -256,7 +246,7 @@ async function run(kernel: Kernel, line: string, echo = true): Promise<number> {
     return 0
   }
   if (line.trim() === 'help') {
-    print(`Commands: echo, cat, wc, ls (WASI) · node (JS) · cd, pwd, export, true, false (shell builtins)\n`)
+    print(`Commands: echo, cat, wc, ls (WASI) · node, npm, npx, sh (JS) · cd, pwd, export, true, false (shell builtins)\n`)
     print(`Operators: |  >  >>  <  &&  ||  ;   Ctrl+C kills the running pipeline.\n`)
     return 0
   }
@@ -297,7 +287,7 @@ async function boot(): Promise<void> {
   ])
   // Node's standard library, shared with every Node process (ADR-0012).
   kernel.addAsset('node-lib', nodeLib)
-  installRootfs(kernel, binaries)
+  installRootfs(kernel, binaries, userland)
   kernel.events.subscribe(logEvent)
   setupPreview(kernel)
 

@@ -14,6 +14,8 @@ export type ProcessState = 'starting' | 'running' | 'exited'
 export class Process {
   readonly pid: number
   readonly ppid: number
+  /** Process group: a job that receives terminal signals together, as on Linux. */
+  pgid: number
   readonly argv: string[]
   readonly env: Record<string, string>
   cwd: string
@@ -31,9 +33,10 @@ export class Process {
   page?: SharedArrayBuffer
   private resolveExit!: (code: number) => void
 
-  constructor(init: { pid: number; ppid: number; argv: string[]; env: Record<string, string>; cwd: string }) {
+  constructor(init: { pid: number; ppid: number; pgid?: number; argv: string[]; env: Record<string, string>; cwd: string }) {
     this.pid = init.pid
     this.ppid = init.ppid
+    this.pgid = init.pgid ?? init.pid
     this.argv = init.argv
     this.env = init.env
     this.cwd = init.cwd

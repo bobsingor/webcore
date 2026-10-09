@@ -17,4 +17,5 @@ export const host = {
   queueMicrotask: g.queueMicrotask.bind(g),
   setTimeout: g.setTimeout.bind(g),
   clearTimeout: g.clearTimeout.bind(g),
+  getRandomValues: g.crypto.getRandomValues.bind(g.crypto),
 }

@@ -15,11 +15,12 @@ browser's own JIT. Everything else runs as WebAssembly.
 Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design and roadmap, and
 [docs/adr/](docs/adr/README.md) for the decisions behind it.
 
-## Status: M1c, networking and preview ✅
+## Status: M1d, npm ✅
 
 `node` is **Node.js v24.21.0**: Node's own JavaScript standard library, unmodified, running on the
 browser's JavaScript engine over bindings written against the kernel. The bindings replace the C++
-half of Node (ADR-0005, ADR-0012). Servers it starts open in a preview pane (ADR-0014).
+half of Node (ADR-0005, ADR-0012). Servers it starts open in a preview pane (ADR-0014), and
+`npm create vite` + `npm install` work against the real npm registry (ADR-0015).
 
 ```sh
 user@webcore:~$ node -p "process.version + ' on ' + process.platform"
@@ -36,6 +37,8 @@ What works:
   - an in-memory VFS, `spawn`/`wait`/`kill`, signals reported as signals
   - a kernel-side `spawnSync`
   - virtual TCP on one loopback host: `listen`/`accept`/`connect`/`shutdown` (ADR-0014)
+  - symbolic and hard links, process groups (Ctrl+C stops a whole job), and `extract`, which
+    unpacks an npm tarball in one syscall (ADR-0015)
 - **Syscall ABI:** Linux semantics and errno values. Sync calls block on a shared-memory page. Async
   calls go over a MessagePort, so Node's event loop keeps running.
 - **Node.js:**
@@ -48,7 +51,14 @@ What works:
     and CommonJS interop including `require(esm)` (ADR-0013). The real `create-vite` CLI
     scaffolds a React app
   - `net`, `http` and `dns` over the kernel's sockets, between processes or within one
-  - 60 of 72 builtin modules load; the rest are scheduled (see [the M1 plan](docs/milestones/M1.md))
+  - `zlib` (byte-identical to Node's) and `crypto` (digests, HMAC, PBKDF2, HKDF, random, secret
+    keys, and WebCrypto digest/HMAC/PBKDF2/HKDF)
+  - 66 of 72 builtin modules load; the rest are scheduled (see [the M1 plan](docs/milestones/M1.md))
+- **npm and sh** (ADR-0015): webcore's own programs, running as processes on its Node.
+  - **npm:** `install`, `ci`, `uninstall`, `run`, `exec`/`npx`, `init`/`create`, with npm's
+    `node_modules` layout, lockfile and `.bin` links. Native packages are swapped for their
+    wasm32-wasi builds.
+  - **sh:** a POSIX-subset shell, which Node's `child_process` uses as its shell.
 - **Preview:** a server listening on a port is served in an iframe on `p<port>.localhost`, through a
   Service Worker and a bridge to the kernel. Page requests, cookies and WebSockets work (ADR-0014).
 - **WASI preview1:** args, env, preopens, files, directories, pipes, clocks, random, sleeps.
@@ -57,7 +67,7 @@ What works:
 
 ## Quick start
 
-Requires Node ≥ 22.6 and pnpm.
+Requires Node ≥ 22.13 and pnpm.
 
 ```bash
 pnpm install
@@ -67,10 +77,12 @@ pnpm install
 pnpm dev
 ```
 
-`pnpm dev` builds the WASI test binaries and the Node standard library bundle first.
+`pnpm dev` builds the WASI test binaries, the Node standard library bundle and the userland
+programs first.
 
 `pnpm dev` opens the playground at http://localhost:5180: a terminal, example commands, a preview
-pane, and a live kernel event log. Try "HTTP server + preview".
+pane, and a live kernel event log. Try "HTTP server + preview", or "npm create vite (React)" then
+"npm install".
 
 ```bash
 pnpm test
@@ -99,6 +111,7 @@ packages/
     src/preview/         preview bridge, Service Worker, client script, Vite plugin (ADR-0014)
     test/                unit + end-to-end tests
   node-lib/              Node v24.21.0's lib/, vendored, plus the bundle builder (ADR-0012)
+  userland/              webcore's own programs in TypeScript: sh, npm, npx (ADR-0015)
   wat-bin/               hand-written WASI programs (echo, cat, wc, ls), no C toolchain needed
 apps/
   playground/            browser demo (Vite)
@@ -111,7 +124,8 @@ import { Kernel, installRootfs, exec, DEFAULT_ENV } from '@webcore/kernel'
 import { webProcessHost } from '@webcore/kernel/web' // or nodeProcessHost from '@webcore/kernel/node'
 
 const kernel = new Kernel({ host: webProcessHost(), assets: { 'node-lib': nodeLibBytes } })
-installRootfs(kernel, { echo: echoWasmBytes /* … */ })
+// userland: @webcore/userland's dist/userland.json (sh, npm, npx)
+installRootfs(kernel, { echo: echoWasmBytes /* … */ }, userland)
 kernel.events.subscribe((event) => console.log(event))
 
 const { code, stdout } = await exec(kernel, ['node', '-p', '6 * 7'], { env: { ...DEFAULT_ENV } })
@@ -135,13 +149,21 @@ kernel.events.subscribe((event) => {
 
 ## Known limitations
 
-- **Networking is local only**: no outbound `http(s)` (M1d), Unix domain sockets, UDP or HTTP/2.
-  Previews work inside the page that runs the kernel, not in a tab of their own.
-- **No `crypto` or `zlib` yet**, and **no package installer or `sh` process** (M1d).
+- **Networking is local only.**
+  - Global `fetch` reaches the internet (with CORS), but Node's `http`/`https` modules can't
+    (after M1e).
+  - No Unix domain sockets, UDP or HTTP/2.
+  - Previews work inside the page that runs the kernel, not in a tab of their own.
+- **crypto has no OpenSSL.** Ciphers, signatures, asymmetric keys and TLS throw. zlib has no
+  Brotli or zstd.
+- **npm is webcore's own.** It skips dependencies' install scripts, and doesn't publish or do
+  workspaces, `git:`/`file:` specs or global installs (ADR-0015).
 - **No `fs.watch`, `worker_threads` or Wasm native addons** (M1e).
 - **The kernel runs on the page's main thread.** It moves into an isolated iframe in M1e (ADR-0009).
 - **The VFS is in-memory and mutable**, with no symlinks. The content-addressed copy-on-write store
   comes in M2 (ADR-0007).
 - **No TTY/PTY yet**: stdio is pipes and files (M2).
-- **The host-side shell is minimal.** A real bash/BusyBox via WASIX comes in M2.
+- **The terminal's shell is host-side and minimal.** It hands `rm`, `mkdir` and similar to
+  `/bin/sh`. A terminal that runs a shell process needs a PTY (M2), and coreutils arrive with
+  BusyBox via WASIX.
 - **WASI binaries are hand-written WAT.** Real wasi-sdk/WASIX builds arrive in M2.

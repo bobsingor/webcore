@@ -1,7 +1,5 @@
-// Gzipped tarballs (npm packages) → kernel filesystem. Uses DecompressionStream, available in
-// browsers, Node, Deno and Bun. The package installer (M1d) builds on this.
-import type { Kernel } from '../kernel/kernel.ts'
-import { dirname, resolve } from '../kernel/path.ts'
+// Tar archives and gzip, for npm packages. DecompressionStream is available in browsers, Node, Deno
+// and Bun, and runs natively.
 
 export interface TarEntry {
   path: string
@@ -11,6 +9,10 @@ export interface TarEntry {
 }
 
 const decoder = new TextDecoder()
+
+export function isGzip(bytes: Uint8Array): boolean {
+  return bytes[0] === 0x1f && bytes[1] === 0x8b
+}
 
 export async function gunzip(bytes: Uint8Array): Promise<Uint8Array> {
   const stream = new Blob([bytes as Uint8Array<ArrayBuffer>]).stream().pipeThrough(new DecompressionStream('gzip'))
@@ -61,26 +63,4 @@ export function parseTar(archive: Uint8Array): TarEntry[] {
     else if (type === '5') entries.push({ path: name, type: 'directory', mode: octal(header, 100, 8), data: new Uint8Array(0) })
   }
   return entries
-}
-
-/**
- * Unpacks a gzipped npm tarball into `destination`, dropping its leading directory
- * (`package/` for npm). Returns the number of files written.
- */
-export async function installTarball(kernel: Kernel, tarball: Uint8Array, destination: string): Promise<number> {
-  const entries = parseTar(await gunzip(tarball))
-  let files = 0
-  for (const entry of entries) {
-    const relative = entry.path.split('/').slice(1).join('/')
-    if (!relative || relative.split('/').includes('..')) continue
-    const target = resolve(destination, relative)
-    if (entry.type === 'directory') {
-      kernel.fs.mkdirp(target)
-      continue
-    }
-    kernel.fs.mkdirp(dirname(target))
-    kernel.fs.writeFile(target, entry.data, entry.mode & 0o777 || 0o644)
-    files++
-  }
-  return files
 }

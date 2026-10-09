@@ -20,11 +20,12 @@ export const S_IFIFO = 0o010000
 export const S_IFCHR = 0o020000
 export const S_IFDIR = 0o040000
 export const S_IFREG = 0o100000
+export const S_IFLNK = 0o120000
 export const S_IFSOCK = 0o140000
 
 export const DEFAULT_PATH = '/usr/bin:/bin'
 
-export type FileType = 'file' | 'dir' | 'chardev' | 'fifo' | 'socket'
+export type FileType = 'file' | 'dir' | 'chardev' | 'fifo' | 'socket' | 'symlink'
 
 export interface Stat {
   type: FileType

@@ -12,7 +12,7 @@ export const VERSIONS = {
   modules: '137',
   napi: '10',
   nghttp2: '1.66.0',
-  openssl: '3.5.4',
+  openssl: '3.5.8',
   simdjson: '4.0.7',
   simdutf: '7.3.6',
   tz: '2025b',

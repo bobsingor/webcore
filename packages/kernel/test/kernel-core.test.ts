@@ -50,6 +50,57 @@ describe('MemFS', () => {
   })
 })
 
+describe('MemFS links', () => {
+  it('follows symbolic links, relative ones from the link, .. physically', () => {
+    const fs = new MemFS()
+    fs.mkdirp('/pkg/bin')
+    fs.writeFile('/pkg/bin/cli.js', 'cli')
+    fs.mkdirp('/app/node_modules/.bin')
+    fs.symlink('/pkg', '/app/node_modules/pkg')
+    fs.symlink('../pkg/bin/cli.js', '/app/node_modules/.bin/cli')
+    expect(text(fs.readFile('/app/node_modules/.bin/cli'))).toBe('cli')
+    expect(fs.realpath('/app/node_modules/.bin/cli')).toBe('/pkg/bin/cli.js')
+    expect(fs.lookup('/app/node_modules/.bin/cli', false).kind).toBe('symlink')
+    expect(fs.readlink('/app/node_modules/.bin/cli')).toBe('../pkg/bin/cli.js')
+    expect(fs.stat(fs.lookup('/app/node_modules/.bin/cli', false))).toMatchObject({ type: 'symlink', size: 17 })
+    expect(fs.readdir(fs.lookup('/app/node_modules') as never).map((entry) => [entry.name, entry.type])).toEqual([
+      ['.bin', 'dir'],
+      ['pkg', 'symlink'],
+    ])
+    // A file created through a linked directory lands in the target.
+    fs.writeFile('/app/node_modules/pkg/new.txt', 'x')
+    expect(fs.lookup('/pkg/new.txt').kind).toBe('file')
+    fs.mkdirp('/app/node_modules/pkg/deep/dir')
+    expect(fs.lookup('/pkg/deep/dir').kind).toBe('dir')
+    // Removing the link leaves the target alone.
+    fs.unlink('/app/node_modules/pkg')
+    expect(fs.lookup('/pkg/bin/cli.js').kind).toBe('file')
+  })
+
+  it('detects loops and dangling links, and refuses to readlink a file', () => {
+    const fs = new MemFS()
+    fs.symlink('/b', '/a')
+    fs.symlink('/a', '/b')
+    fs.symlink('/nowhere', '/dangling')
+    fs.writeFile('/file', 'x')
+    expect(errnoOf(() => fs.lookup('/a'))).toBe(Errno.ELOOP)
+    expect(errnoOf(() => fs.lookup('/dangling'))).toBe(Errno.ENOENT)
+    expect(fs.tryLookup('/dangling')).toBeUndefined()
+    expect(fs.tryLookup('/dangling', false)?.kind).toBe('symlink')
+    expect(errnoOf(() => fs.readlink('/file'))).toBe(Errno.EINVAL)
+  })
+
+  it('counts hard links', () => {
+    const fs = new MemFS()
+    const node = fs.writeFile('/one', 'shared')
+    fs.hardlink('/one', '/two')
+    expect(fs.stat(node).nlink).toBe(2)
+    fs.unlink('/one')
+    expect(text(fs.readFile('/two'))).toBe('shared')
+    expect(fs.stat(node).nlink).toBe(1)
+  })
+})
+
 describe('Pipe', () => {
   it('blocks readers until data arrives and signals EOF after the writer closes', async () => {
     const pipe = new Pipe()

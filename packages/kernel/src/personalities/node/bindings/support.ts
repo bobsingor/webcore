@@ -283,7 +283,7 @@ export function supportBindings() {
 
     config: () => ({
       isDebugBuild: false,
-      hasOpenSSL: false,
+      hasOpenSSL: true,
       openSSLIsBoringSSL: false,
       fipsMode: false,
       // No ICU binding yet: Node falls back to its JavaScript TextDecoder and punycode.

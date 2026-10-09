@@ -1,9 +1,9 @@
 // In-memory filesystem. M0 keeps it mutable and path-based; ADR-0007's content-addressed,
 // copy-on-write store replaces the storage behind this same interface in M2.
-import { kerr } from '../abi/errno.ts'
-import { S_IFCHR, S_IFDIR, S_IFREG } from '../abi/constants.ts'
+import { Errno, KernelError, kerr } from '../abi/errno.ts'
+import { S_IFCHR, S_IFDIR, S_IFLNK, S_IFREG } from '../abi/constants.ts'
 import type { Dirent, Stat } from '../abi/constants.ts'
-import { basename, dirname, normalize, segments } from './path.ts'
+import { basename, dirname, normalize } from './path.ts'
 
 export type DeviceName = 'null'
 
@@ -22,6 +22,8 @@ export interface FileNode extends NodeBase {
   size: number
   /** Bumped on every content change; used for cache invalidation. */
   version: number
+  /** Hard links to this file. */
+  nlink: number
 }
 
 export interface DirNode extends NodeBase {
@@ -34,7 +36,15 @@ export interface DevNode extends NodeBase {
   device: DeviceName
 }
 
-export type VNode = FileNode | DirNode | DevNode
+export interface SymlinkNode extends NodeBase {
+  kind: 'symlink'
+  target: string
+}
+
+export type VNode = FileNode | DirNode | DevNode | SymlinkNode
+
+// Linux's MAXSYMLINKS.
+const MAX_SYMLINKS = 40
 
 const encoder = new TextEncoder()
 
@@ -46,28 +56,53 @@ export class MemFS {
     this.root = { kind: 'dir', children: new Map(), ...this.base(0o755) }
   }
 
-  lookup(path: string): VNode {
-    let node: VNode = this.root
-    for (const name of segments(path)) {
-      if (node.kind !== 'dir') throw kerr('ENOTDIR', path)
-      const child = node.children.get(name)
-      if (!child) throw kerr('ENOENT', path)
-      node = child
-    }
-    return node
+  /** Finds the node at `path`, following symbolic links (the last one only if `follow`). */
+  lookup(path: string, follow = true): VNode {
+    return this.walk(path, follow).node
   }
 
-  /** Like lookup, but returns undefined when the final component is missing. */
-  tryLookup(path: string): VNode | undefined {
+  /** Like lookup, but returns undefined when the final component (or its link target) is missing. */
+  tryLookup(path: string, follow = true): VNode | undefined {
     if (normalize(path) === '/') return this.root
-    const parent = this.parentDir(path)
-    return parent.children.get(basename(path))
+    const child = this.parentDir(path).children.get(basename(path))
+    if (!child || child.kind !== 'symlink' || !follow) return child
+    try {
+      return this.lookup(path)
+    } catch {
+      return undefined
+    }
+  }
+
+  /** The canonical path of `path`: absolute, with every symbolic link resolved. */
+  realpath(path: string): string {
+    return this.walk(path, true).path
   }
 
   createFile(path: string, mode = 0o644): FileNode {
-    const node: FileNode = { kind: 'file', data: new Uint8Array(0), size: 0, version: 0, ...this.base(mode) }
+    const node: FileNode = { kind: 'file', data: new Uint8Array(0), size: 0, version: 0, nlink: 1, ...this.base(mode) }
     this.link(path, node)
     return node
+  }
+
+  symlink(target: string, path: string): SymlinkNode {
+    if (!target) throw kerr('ENOENT', path)
+    const node: SymlinkNode = { kind: 'symlink', target, ...this.base(0o777) }
+    this.link(path, node)
+    return node
+  }
+
+  readlink(path: string): string {
+    const node = this.lookup(path, false)
+    if (node.kind !== 'symlink') throw kerr('EINVAL', path)
+    return node.target
+  }
+
+  /** A hard link: `to` becomes another name for the file at `from`. */
+  hardlink(from: string, to: string): void {
+    const node = this.lookup(from, false)
+    if (node.kind === 'dir') throw kerr('EPERM', from)
+    this.link(to, node)
+    if (node.kind === 'file') node.nlink++
   }
 
   mkdir(path: string, mode = 0o755): DirNode {
@@ -77,17 +112,21 @@ export class MemFS {
   }
 
   mkdirp(path: string): DirNode {
-    let current = this.root
-    for (const name of segments(path)) {
-      let next = current.children.get(name)
-      if (!next) {
-        next = { kind: 'dir', children: new Map(), ...this.base(0o755) }
-        current.children.set(name, next)
-      }
-      if (next.kind !== 'dir') throw kerr('ENOTDIR', path)
-      current = next
+    let existing: VNode | undefined
+    try {
+      existing = this.lookup(path)
+    } catch (error) {
+      if (!(error instanceof KernelError) || error.errno !== Errno.ENOENT) throw error
     }
-    return current
+    if (existing) {
+      if (existing.kind !== 'dir') throw kerr('ENOTDIR', path)
+      return existing
+    }
+    const parent = this.mkdirp(dirname(path))
+    const node: DirNode = { kind: 'dir', children: new Map(), ...this.base(0o755) }
+    parent.children.set(basename(path), node)
+    this.touch(parent)
+    return node
   }
 
   mknod(path: string, device: DeviceName): DevNode {
@@ -103,6 +142,7 @@ export class MemFS {
     if (!node) throw kerr('ENOENT', path)
     if (node.kind === 'dir') throw kerr('EISDIR', path)
     parent.children.delete(name)
+    if (node.kind === 'file') node.nlink--
     this.touch(parent)
   }
 
@@ -133,6 +173,8 @@ export class MemFS {
       if (node.kind === 'dir' && existing.kind !== 'dir') throw kerr('ENOTDIR', to)
       if (node.kind !== 'dir' && existing.kind === 'dir') throw kerr('EISDIR', to)
       if (existing.kind === 'dir' && existing.children.size) throw kerr('ENOTEMPTY', to)
+      if (existing === node) return
+      if (existing.kind === 'file') existing.nlink--
     }
     fromParent.children.delete(basename(from))
     toParent.children.set(basename(to), node)
@@ -148,13 +190,13 @@ export class MemFS {
 
   stat(node: VNode): Stat {
     const type = typeOf(node)
-    const kindBits = node.kind === 'dir' ? S_IFDIR : node.kind === 'dev' ? S_IFCHR : S_IFREG
+    const kindBits = KIND_BITS[node.kind]
     return {
       type,
       mode: kindBits | node.mode,
       ino: node.ino,
-      nlink: node.kind === 'dir' ? 2 : 1,
-      size: node.kind === 'file' ? node.size : node.kind === 'dir' ? 4096 : 0,
+      nlink: node.kind === 'dir' ? 2 : node.kind === 'file' ? node.nlink : 1,
+      size: node.kind === 'file' ? node.size : node.kind === 'dir' ? 4096 : node.kind === 'symlink' ? encoder.encode(node.target).length : 0,
       atimeMs: node.atimeMs,
       mtimeMs: node.mtimeMs,
       ctimeMs: node.ctimeMs,
@@ -215,6 +257,43 @@ export class MemFS {
     node.mtimeMs = node.ctimeMs = Date.now()
   }
 
+  /**
+   * Resolves a path component by component. Symbolic links are expanded in place, and `..` after
+   * a link goes to the parent of the link's target, as on Linux.
+   */
+  private walk(path: string, follow: boolean): { node: VNode; path: string } {
+    const pending = rawSegments(path).reverse()
+    const nodes: VNode[] = [this.root]
+    const names: string[] = []
+    let hops = 0
+    while (pending.length) {
+      const name = pending.pop()!
+      const current = nodes[nodes.length - 1]
+      if (current.kind !== 'dir') throw kerr('ENOTDIR', path)
+      if (name === '..') {
+        if (names.length) {
+          names.pop()
+          nodes.pop()
+        }
+        continue
+      }
+      const child = current.children.get(name)
+      if (!child) throw kerr('ENOENT', path)
+      if (child.kind === 'symlink' && (pending.length || follow)) {
+        if (++hops > MAX_SYMLINKS) throw kerr('ELOOP', path)
+        if (child.target.startsWith('/')) {
+          nodes.length = 1
+          names.length = 0
+        }
+        for (const part of rawSegments(child.target).reverse()) pending.push(part)
+        continue
+      }
+      nodes.push(child)
+      names.push(name)
+    }
+    return { node: nodes[nodes.length - 1], path: `/${names.join('/')}` }
+  }
+
   private parentDir(path: string): DirNode {
     if (normalize(path) === '/') throw kerr('EEXIST', path)
     const parent = this.lookup(dirname(path))
@@ -240,6 +319,12 @@ export class MemFS {
   }
 }
 
+const KIND_BITS: Record<VNode['kind'], number> = { file: S_IFREG, dir: S_IFDIR, dev: S_IFCHR, symlink: S_IFLNK }
+
 function typeOf(node: VNode): Dirent['type'] {
   return node.kind === 'dev' ? 'chardev' : node.kind
+}
+
+function rawSegments(path: string): string[] {
+  return path.split('/').filter((segment) => segment && segment !== '.')
 }

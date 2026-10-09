@@ -40,7 +40,7 @@ describe('personalities', () => {
   })
 
   it('lists directories through fd_readdir', async () => {
-    expect((await sh(kernel, 'ls /usr/bin')).stdout).toBe('cat\necho\nls\nnode\nwc\n')
+    expect((await sh(kernel, 'ls /usr/bin')).stdout).toBe('cat\necho\nls\nnode\nnpm\nnpx\nwc\n')
   })
 
   it('reads stdin synchronously and asynchronously from JavaScript', async () => {

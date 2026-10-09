@@ -71,6 +71,46 @@ describe('bindings', () => {
     ).toBe('+€|€\n')
   })
 
+  it('creates and resolves symbolic links, for fs and for module loading', async () => {
+    kernel.fs.mkdirp('/home/user/pkg/lib')
+    kernel.fs.writeFile('/home/user/pkg/lib/index.js', "module.exports = __filename + ' ' + require('./sibling')")
+    kernel.fs.writeFile('/home/user/pkg/lib/sibling.js', "module.exports = 'sibling'")
+    const result = await node(
+      [
+        "const fs = require('fs')",
+        "fs.mkdirSync('node_modules')",
+        "fs.symlinkSync('../pkg/lib', 'node_modules/linked')",
+        "console.log(fs.readlinkSync('node_modules/linked'), fs.lstatSync('node_modules/linked').isSymbolicLink(), fs.statSync('node_modules/linked').isDirectory())",
+        "console.log(fs.realpathSync('node_modules/linked/index.js'), fs.realpathSync.native('node_modules/linked'))",
+        "console.log(require('linked'))",
+        "console.log(fs.readdirSync('node_modules', { withFileTypes: true }).map((d) => d.name + ':' + d.isSymbolicLink()))",
+        "fs.rmSync('node_modules', { recursive: true })",
+        "console.log(fs.existsSync('pkg/lib/index.js'), fs.existsSync('node_modules'))",
+      ].join('; '),
+    )
+    expect(result.stderr).toBe('')
+    expect(result.stdout).toBe(
+      [
+        '../pkg/lib true true',
+        '/home/user/pkg/lib/index.js /home/user/pkg/lib',
+        '/home/user/pkg/lib/index.js sibling',
+        '[ \'linked:true\' ]',
+        'true false',
+        '',
+      ].join('\n'),
+    )
+  })
+
+  it('runs a program through a symlinked bin, like node_modules/.bin', async () => {
+    kernel.fs.mkdirp('/home/user/node_modules/tool/bin')
+    kernel.fs.mkdirp('/home/user/node_modules/.bin')
+    kernel.fs.writeFile('/home/user/node_modules/tool/bin/cli.mjs', '#!/usr/bin/env node\nconsole.log(process.argv[1], import.meta.url, process.argv[2])\n', 0o755)
+    kernel.fs.symlink('../tool/bin/cli.mjs', '/home/user/node_modules/.bin/tool')
+    expect((await sh(kernel, 'node_modules/.bin/tool arg')).stdout).toBe(
+      '/home/user/node_modules/.bin/tool file:///home/user/node_modules/tool/bin/cli.mjs arg\n',
+    )
+  })
+
   it('streams files through fs.createReadStream', async () => {
     expect((await node("require('fs').createReadStream('/etc/hostname').pipe(process.stdout)")).stdout).toBe('webcore\n')
   })
@@ -82,14 +122,53 @@ describe('bindings', () => {
     const later = [
       // nghttp2 (not scheduled yet)
       'http2',
-      // crypto and zlib (M1d)
-      '_tls_common', '_tls_wrap', 'crypto', 'https', 'tls', 'zlib',
       // vm contexts; V8 serializer
       'repl', 'node:test',
       // Like official builds without them
       'inspector', 'inspector/promises', 'trace_events',
     ]
     expect(stdout.trim().split(' ').sort()).toEqual(later.sort())
+  })
+})
+
+describe('crypto', () => {
+  it('hashes, signs and derives like OpenSSL, sync, async and through WebCrypto', async () => {
+    const result = await node(
+      [
+        "const crypto = require('crypto')",
+        "console.log(crypto.createHash('sha256').update('hello').digest('hex'))",
+        "console.log(crypto.hash('md5', 'hello'), crypto.createHmac('sha1', 'key').update('data').digest('base64'))",
+        "console.log(crypto.pbkdf2Sync('pw', 'salt', 100, 16, 'sha512').toString('hex'))",
+        "console.log(crypto.randomUUID().length, crypto.timingSafeEqual(Buffer.from('a'), Buffer.from('a')))",
+        "crypto.subtle.digest('SHA-1', new Uint8Array([1])).then((d) => console.log(Buffer.from(d).toString('hex')))",
+      ].join('; '),
+    )
+    expect(result.stderr).toBe('')
+    expect(result.stdout).toBe(
+      [
+        '2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824',
+        '5d41402abc4b2a76b9719d911017c592 EEFSxb/coHvGM+69RhmfAlXJ9J0=',
+        '3a3c4d6f183d46cd82a4f3b4e774514d',
+        '36 true',
+        'bf8b4530d8d246dd74ac53a13471bba17941dff7',
+        '',
+      ].join('\n'),
+    )
+  })
+
+  it('reports what needs OpenSSL with Node’s own error codes', async () => {
+    const result = await node(
+      [
+        "const crypto = require('crypto')",
+        "const code = (fn) => { try { fn() } catch (e) { return e.code ?? e.message } }",
+        "console.log(code(() => crypto.createCipheriv('aes-128-cbc', Buffer.alloc(16), Buffer.alloc(16))))",
+        "console.log(code(() => crypto.createSign('sha256').update('x').sign('key')), code(() => crypto.scryptSync('a', 'b', 8)))",
+        "console.log(code(() => crypto.createHash('whirlpool')), code(() => crypto.createHmac('whirlpool', 'k')))",
+      ].join('; '),
+    )
+    expect(result.stdout).toBe(
+      'ERR_CRYPTO_UNKNOWN_CIPHER\nERR_FEATURE_UNAVAILABLE_ON_PLATFORM ERR_CRYPTO_SCRYPT_NOT_SUPPORTED\nDigest method not supported ERR_CRYPTO_INVALID_DIGEST\n',
+    )
   })
 })
 

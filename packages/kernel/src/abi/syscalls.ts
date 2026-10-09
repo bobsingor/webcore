@@ -1,4 +1,5 @@
 import type { Dirent, Stat } from './constants.ts'
+import type { ExtractOptions } from '../kernel/extract.ts'
 
 export interface SpawnSyncRequest {
   cwd?: string
@@ -27,6 +28,8 @@ export interface SpawnRequest {
   env?: Record<string, string>
   /** Caller fds that become the child's 0, 1 and 2. A negative value means /dev/null. */
   fds?: [number, number, number]
+  /** Start a new process group instead of joining the caller's. */
+  detached?: boolean
 }
 
 export type AddressFamily = 'IPv4' | 'IPv6'
@@ -58,6 +61,15 @@ export interface Syscalls {
   ftruncate(fd: number, length: number): number
   fstat(fd: number): Stat
   stat(path: string, dirfd?: number): Stat
+  /** Like stat, but a symbolic link describes itself. */
+  lstat(path: string, dirfd?: number): Stat
+  readlink(path: string, dirfd?: number): string
+  /** Creates `path` as a symbolic link to `target`, which is stored as given. */
+  symlink(target: string, path: string, dirfd?: number): number
+  /** Creates a hard link `to` for the file at `from`. */
+  link(from: string, to: string, fromDirfd?: number, toDirfd?: number): number
+  /** The canonical absolute path, with every symbolic link resolved. */
+  realpath(path: string): string
   getdents(fd: number): Dirent[]
   mkdir(path: string, mode?: number, dirfd?: number): number
   unlink(path: string, dirfd?: number): number
@@ -68,7 +80,10 @@ export interface Syscalls {
   pipe(): [number, number]
   spawn(argv: string[], request?: SpawnRequest): number
   wait(pid: number): number
-  /** Signal 0 checks that the process exists; any other signal terminates it with 128 + signal. */
+  /**
+   * Signal 0 checks that the process exists; any other signal terminates it with 128 + signal. A
+   * negative pid targets the process group -pid, and 0 the caller's own group.
+   */
   kill(pid: number, signal: number): number
   /** Like wait, but distinguishes exit codes from signals: [code, signal] (one of them is null). */
   waitStatus(pid: number): [code: number | null, signal: number | null]
@@ -82,6 +97,11 @@ export interface Syscalls {
   connect(address: string, port: number): SocketInfo
   /** Closes a socket's write direction (SHUT_WR): the peer reads EOF. */
   shutdown(fd: number): number
+  /**
+   * Unpacks a (gzipped) tar archive into `dir`, after checking `integrity` when given (ADR-0015).
+   * Returns the number of files written; EBADMSG when the integrity check fails.
+   */
+  extract(archive: Uint8Array, dir: string, options?: ExtractOptions): number
 }
 
 export type SyscallName = keyof Syscalls

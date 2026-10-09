@@ -15,7 +15,7 @@ import { uvCode, uvException } from '../uv.ts'
 import { host } from '../host.ts'
 
 const kFsStatsFieldsNumber = 18
-const UV_DIRENT: Record<FileType, number> = { file: 1, dir: 2, fifo: 4, socket: 5, chardev: 6 }
+const UV_DIRENT: Record<FileType, number> = { file: 1, dir: 2, symlink: 3, fifo: 4, socket: 5, chardev: 6 }
 const COPYFILE_EXCL = 1
 
 type Request = { oncomplete(error: unknown, value?: unknown): void } | symbol | undefined
@@ -148,6 +148,7 @@ export function fsBindings() {
       }
 
       const stat = (path: string) => sys.call('stat', path)
+      const lstat = (path: string) => sys.call('lstat', path)
 
       const mkdirp = (path: string, mode: number): string | undefined => {
         const absolute = path.startsWith('/') ? path : `${sys.call('getcwd')}/${path}`
@@ -166,8 +167,9 @@ export function fsBindings() {
         return first
       }
 
+      // Links are removed, never followed.
       const removeTree = (path: string): void => {
-        if (stat(path).type === 'dir') {
+        if (lstat(path).type === 'dir') {
           for (const entry of listDirectory(path)) removeTree(`${path}/${entry.name}`)
           sys.call('rmdir', path)
         } else {
@@ -319,13 +321,13 @@ export function fsBindings() {
           const target = pathOf(path)
           if (req === undefined && !throwIfNoEntry) {
             try {
-              return statValues(stat(target), bigint)
+              return statValues(lstat(target), bigint)
             } catch (error) {
               if (isErrno(error, Errno.ENOENT) || isErrno(error, Errno.ENOTDIR)) return undefined
               throw uvException(error, 'lstat', target)
             }
           }
-          return dispatch(req, ['lstat', target], () => statValues(stat(target), bigint))
+          return dispatch(req, ['lstat', target], () => statValues(lstat(target), bigint))
         },
         fstat: (fd: number, bigint: boolean, req?: Request, shouldNotThrow = false) => {
           if (req === undefined && shouldNotThrow) {
@@ -402,10 +404,19 @@ export function fsBindings() {
             }
           }),
         rmdir: (path: unknown, req?: Request) => dispatch(req, ['rmdir', pathOf(path)], () => void sys.call('rmdir', pathOf(path))),
+        // Like the C++ (std::filesystem::remove_all), a missing path is not an error: lib/fs.js
+        // checks `force` itself.
         rmSync: (path: unknown, _maxRetries: number, recursive: boolean) =>
           dispatch(undefined, ['rm', pathOf(path)], () => {
             const target = pathOf(path)
-            if (stat(target).type === 'dir' && !recursive) throw new SysError(Errno.EISDIR, 'rm')
+            let type: string
+            try {
+              type = lstat(target).type
+            } catch (error) {
+              if (isErrno(error, Errno.ENOENT)) return
+              throw error
+            }
+            if (type === 'dir' && !recursive) throw new SysError(Errno.EISDIR, 'rm')
             removeTree(target)
           }),
         unlink: (path: unknown, req?: Request) => dispatch(req, ['unlink', pathOf(path)], () => void sys.call('unlink', pathOf(path))),
@@ -421,32 +432,18 @@ export function fsBindings() {
           }),
         realpath: (path: unknown, encoding: unknown, req?: Request) =>
           dispatch(req, ['realpath', pathOf(path)], () => {
-            const target = pathOf(path)
-            const absolute = target.startsWith('/') ? target : `${sys.call('getcwd')}/${target}`
-            stat(absolute)
-            const parts: string[] = []
-            for (const part of absolute.split('/')) {
-              if (!part || part === '.') continue
-              if (part === '..') parts.pop()
-              else parts.push(part)
-            }
-            const resolved = `/${parts.join('/')}`
+            const resolved = sys.call('realpath', pathOf(path))
             return encoding === 'buffer' ? realm.newBuffer(encode(resolved, 'utf8')) : resolved
           }),
-        // The VFS has no symbolic links yet (M1d): nothing is a link, and links can't be created.
-        readlink: (path: unknown, _encoding: unknown, req?: Request) =>
+        readlink: (path: unknown, encoding: unknown, req?: Request) =>
           dispatch(req, ['readlink', pathOf(path)], () => {
-            stat(pathOf(path))
-            throw new SysError(Errno.EINVAL, 'readlink')
+            const target = sys.call('readlink', pathOf(path))
+            return encoding === 'buffer' ? realm.newBuffer(encode(target, 'utf8')) : target
           }),
         symlink: (target: unknown, path: unknown, _flags: number, req?: Request) =>
-          dispatch(req, ['symlink', pathOf(target), pathOf(path)], () => {
-            throw new SysError(Errno.ENOSYS, 'symlink')
-          }),
+          dispatch(req, ['symlink', pathOf(target), pathOf(path)], () => void sys.call('symlink', pathOf(target), pathOf(path))),
         link: (from: unknown, to: unknown, req?: Request) =>
-          dispatch(req, ['link', pathOf(from), pathOf(to)], () => {
-            throw new SysError(Errno.ENOSYS, 'link')
-          }),
+          dispatch(req, ['link', pathOf(from), pathOf(to)], () => void sys.call('link', pathOf(from), pathOf(to))),
         // Permissions, ownership and timestamps are not modelled yet: validate the target, then succeed.
         chmod: (path: unknown, _mode: number, req?: Request) => dispatch(req, ['chmod', pathOf(path)], () => void stat(pathOf(path))),
         lchmod: (path: unknown, _mode: number, req?: Request) => dispatch(req, ['lchmod', pathOf(path)], () => void stat(pathOf(path))),

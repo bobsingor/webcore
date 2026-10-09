@@ -2,11 +2,12 @@ import { readdirSync, readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
 import { nodeProcessHost } from '../src/host/node.ts'
-import { createShell, DEFAULT_ENV, installRootfs, Kernel, runLine, type Shell } from '../src/index.ts'
+import { createShell, DEFAULT_ENV, installRootfs, Kernel, runLine, type Shell, type Userland } from '../src/index.ts'
 
 const require = createRequire(import.meta.url)
 const binDir = join(dirname(require.resolve('@webcore/wat-bin/package.json')), 'dist')
 const nodeLib = new Uint8Array(readFileSync(join(dirname(require.resolve('@webcore/node-lib/package.json')), 'dist/node-lib.bin')))
+export const userland: Userland = JSON.parse(readFileSync(join(dirname(require.resolve('@webcore/userland/package.json')), 'dist/userland.json'), 'utf8'))
 
 export const binaries: Record<string, Uint8Array> = Object.fromEntries(
   readdirSync(binDir)
@@ -16,7 +17,7 @@ export const binaries: Record<string, Uint8Array> = Object.fromEntries(
 
 export function boot(): Kernel {
   const kernel = new Kernel({ host: nodeProcessHost(), assets: { 'node-lib': nodeLib } })
-  installRootfs(kernel, binaries)
+  installRootfs(kernel, binaries, userland)
   return kernel
 }
 

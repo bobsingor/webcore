@@ -15,10 +15,11 @@ import type { BootMessage, SyscallReply, SyscallRequest } from '../abi/protocol.
 import { SPAWN_SYNC_HEADER_BYTES } from '../abi/syscalls.ts'
 import type { SocketInfo, SpawnSyncRequest, SyscallArgs, SyscallName, SyscallReturn, SyscallValue } from '../abi/syscalls.ts'
 import { EventBus } from './events.ts'
+import { extractArchive, type ExtractOptions } from './extract.ts'
 import { Listener, Network, Socket } from './net.ts'
 import { resolveExecutable, type Executable } from './exec.ts'
 import { DeviceHandle, DirHandle, FileHandle, PipeReader, PipeWriter, type OpenFile } from './files.ts'
-import { normalize, resolve } from './path.ts'
+import { dirname, normalize, resolve } from './path.ts'
 import { Pipe } from './pipe.ts'
 import { Process, type WorkerLike } from './process.ts'
 import { MemFS, type FileNode } from './vfs.ts'
@@ -43,6 +44,8 @@ export interface SpawnOptions {
   /** Files for fds 0, 1 and 2. The kernel takes its own references; gaps get /dev/null. */
   stdio?: readonly (OpenFile | undefined)[]
   ppid?: number
+  /** Process group to join. By default a process leads a new group of its own. */
+  pgid?: number
 }
 
 type Handler<N extends SyscallName> = (
@@ -105,7 +108,7 @@ export class Kernel {
     const cwd = normalize(options.cwd ?? '/')
     if (this.fs.lookup(cwd).kind !== 'dir') throw kerr('ENOTDIR', cwd)
     const exe = resolveExecutable(this.fs, argv, cwd, env.PATH ?? DEFAULT_PATH)
-    const proc = new Process({ pid: this.nextPid++, ppid: options.ppid ?? 0, argv: exe.argv, env, cwd })
+    const proc = new Process({ pid: this.nextPid++, ppid: options.ppid ?? 0, pgid: options.pgid, argv: exe.argv, env, cwd })
     for (let fd = 0; fd < 3; fd++) {
       proc.fds[fd] = options.stdio?.[fd]?.retain() ?? new DeviceHandle('null', O_RDWR)
     }
@@ -134,6 +137,17 @@ export class Kernel {
     return this.net.connect(address, port)
   }
 
+  /**
+   * Unpacks a (gzipped) tar archive, such as an npm package, into `dir` (ADR-0015). Returns the
+   * number of files written.
+   */
+  async extract(archive: Uint8Array, dir: string, options: ExtractOptions = {}): Promise<number> {
+    const target = normalize(dir)
+    const files = await extractArchive(this.fs, archive, target, options)
+    this.events.emit({ type: 'fs.change', op: 'create', path: target })
+    return files
+  }
+
   getProcess(pid: number): Process | undefined {
     return this.procs.get(pid)
   }
@@ -147,6 +161,13 @@ export class Kernel {
   kill(pid: number, signal = 9): void {
     const proc = this.procs.get(pid)
     if (proc) this.terminate(proc, 128 + signal, signal)
+  }
+
+  /** Signals every live process in a group, as a terminal does for Ctrl+C. */
+  killGroup(pgid: number, signal = 9): void {
+    for (const proc of [...this.procs.values()]) {
+      if (proc.pgid === pgid && proc.alive) this.terminate(proc, 128 + signal, signal)
+    }
   }
 
   shutdown(): void {
@@ -293,6 +314,27 @@ export class Kernel {
 
     stat: (proc, path, dirfd = AT_FDCWD) => this.fs.stat(this.fs.lookup(this.resolveAt(proc, dirfd, path))),
 
+    lstat: (proc, path, dirfd = AT_FDCWD) => this.fs.stat(this.fs.lookup(this.resolveAt(proc, dirfd, path), false)),
+
+    readlink: (proc, path, dirfd = AT_FDCWD) => this.fs.readlink(this.resolveAt(proc, dirfd, path)),
+
+    realpath: (proc, path) => this.fs.realpath(this.resolveAt(proc, AT_FDCWD, path)),
+
+    symlink: (proc, target, path, dirfd = AT_FDCWD) => {
+      if (typeof target !== 'string') throw kerr('EINVAL')
+      const link = this.resolveAt(proc, dirfd, path)
+      this.fs.symlink(target, link)
+      this.events.emit({ type: 'fs.change', op: 'create', path: link })
+      return 0
+    },
+
+    link: (proc, from, to, fromDirfd = AT_FDCWD, toDirfd = AT_FDCWD) => {
+      const target = this.resolveAt(proc, toDirfd, to)
+      this.fs.hardlink(this.resolveAt(proc, fromDirfd, from), target)
+      this.events.emit({ type: 'fs.change', op: 'create', path: target })
+      return 0
+    },
+
     getdents: (proc, fd) => proc.getFd(fd).getdents(),
 
     mkdir: (proc, path, mode = 0o777, dirfd = AT_FDCWD) => {
@@ -343,10 +385,20 @@ export class Kernel {
       const fds = request.fds ?? [0, 1, 2]
       const stdio = [0, 1, 2].map((i) => (fds[i] >= 0 ? proc.getFd(fds[i]) : undefined))
       const cwd = request.cwd === undefined ? proc.cwd : this.resolveAt(proc, AT_FDCWD, request.cwd)
-      return this.spawn(argv, { cwd, env: request.env ?? proc.env, stdio, ppid: proc.pid }).pid
+      // Children join their parent's group unless detached (setsid).
+      const pgid = request.detached ? undefined : proc.pgid
+      return this.spawn(argv, { cwd, env: request.env ?? proc.env, stdio, ppid: proc.pid, pgid }).pid
     },
 
-    kill: (_proc, pid, signal) => {
+    kill: (proc, pid, signal) => {
+      // As kill(2): 0 is the caller's group, a negative pid the group -pid.
+      if (pid <= 0) {
+        const pgid = pid === 0 ? proc.pgid : -pid
+        const members = this.processes.filter((member) => member.pgid === pgid && member.alive)
+        if (!members.length) throw kerr('ESRCH')
+        if (signal !== 0) this.killGroup(pgid, signal | 0)
+        return 0
+      }
       const target = this.procs.get(pid)
       if (!target || !target.alive) throw kerr('ESRCH')
       if (signal !== 0) this.terminate(target, 128 + (signal | 0), signal | 0)
@@ -379,6 +431,11 @@ export class Kernel {
     connect: (proc, address, port) => {
       if (typeof address !== 'string') throw kerr('EINVAL')
       return this.installSocket(proc, this.net.connect(address, Number(port)))
+    },
+
+    extract: (proc, archive, dir, options = {}) => {
+      if (!(archive instanceof Uint8Array)) throw kerr('EINVAL')
+      return this.extract(archive, this.resolveAt(proc, AT_FDCWD, dir), options)
     },
 
     shutdown: (proc, fd) => {
@@ -444,7 +501,7 @@ export class Kernel {
     const header = new Int32Array(SPAWN_SYNC_HEADER_BYTES / 4)
     try {
       const cwd = request.cwd === undefined ? proc.cwd : this.resolveAt(proc, AT_FDCWD, request.cwd)
-      child = this.spawn(argv, { cwd, env: request.env ?? proc.env, stdio, ppid: proc.pid })
+      child = this.spawn(argv, { cwd, env: request.env ?? proc.env, stdio, ppid: proc.pid, pgid: proc.pgid })
     } catch (error) {
       for (const file of held) file.release()
       header[3] = error instanceof KernelError ? error.errno : Errno.EIO
@@ -502,11 +559,15 @@ export class Kernel {
     let node = this.fs.tryLookup(path)
     if (!node) {
       if (!(flags & O_CREAT)) throw kerr('ENOENT', path)
-      node = this.fs.createFile(path, mode & 0o777 & ~UMASK)
-      this.events.emit({ type: 'fs.change', op: 'create', path })
+      // Creating through a dangling symbolic link creates its target, as on Linux.
+      const link = this.fs.tryLookup(path, false)
+      const target = link?.kind === 'symlink' ? resolve(dirname(path), link.target) : path
+      node = this.fs.createFile(target, mode & 0o777 & ~UMASK)
+      this.events.emit({ type: 'fs.change', op: 'create', path: target })
     } else if (flags & O_CREAT && flags & O_EXCL) {
       throw kerr('EEXIST', path)
     }
+    if (node.kind === 'symlink') throw kerr('ELOOP', path)
 
     const access = flags & O_ACCMODE
     if (node.kind === 'dir') {

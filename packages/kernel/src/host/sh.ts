@@ -159,6 +159,17 @@ function expand(word: Word, shell: Shell): string {
     .join('')
 }
 
+// File utilities that /bin/sh provides as builtins (there are no coreutils binaries yet).
+const GUEST_BUILTINS = new Set(['rm', 'mkdir', 'cp', 'mv', 'touch', 'sleep', 'env', 'which', 'test', '['])
+
+/** Runs `rm -rf x` as `/bin/sh -c '"$@"' sh rm -rf x`, which keeps the arguments intact. */
+function viaGuestShell(kernel: Kernel, command: Command): Command {
+  const [name] = command.argv
+  if (!GUEST_BUILTINS.has(name) || !kernel.fs.tryLookup('/bin/sh')) return command
+  const onPath = ['/usr/bin', '/bin'].some((dir) => kernel.fs.tryLookup(`${dir}/${name}`) && name !== 'sh')
+  return onPath ? command : { ...command, argv: ['/bin/sh', '-c', '"$@"', 'sh', ...command.argv] }
+}
+
 /** Runs one line of shell input. Returns the exit status. */
 export async function runLine(
   kernel: Kernel,
@@ -220,7 +231,7 @@ export async function runLine(
     } else if (builtin?.[0] === 'true' || builtin?.[0] === 'false') {
       shell.status = builtin[0] === 'true' ? 0 : 1
     } else {
-      const result = await pipeline(kernel, expanded, { ...io, cwd: shell.cwd, env: shell.env })
+      const result = await pipeline(kernel, expanded.map((command) => viaGuestShell(kernel, command)), { ...io, cwd: shell.cwd, env: shell.env })
       shell.status = result.code
     }
   }
