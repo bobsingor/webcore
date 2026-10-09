@@ -5,7 +5,7 @@
 // FSReqCallback → the result is delivered through req.oncomplete; kUsePromises → a promise.
 // Asynchronous calls use async syscalls where the kernel can block (reads, writes to pipes);
 // everything else runs synchronously in a deferred macrotask.
-import { O_CREAT, O_DIRECTORY, O_EXCL, O_RDONLY, O_TRUNC, O_WRONLY, SEEK_CUR, SEEK_SET } from '../../../abi/constants.ts'
+import { AT_FDCWD, O_CREAT, O_DIRECTORY, O_EXCL, O_RDONLY, O_TRUNC, O_WRONLY, SEEK_CUR, SEEK_SET } from '../../../abi/constants.ts'
 import type { Dirent, FileType, Stat } from '../../../abi/constants.ts'
 import { Errno } from '../../../abi/errno.ts'
 import { SysError } from '../../../process/syscalls.ts'
@@ -483,16 +483,20 @@ export function fsBindings() {
           dispatch(req, ['symlink', pathOf(target), pathOf(path)], () => void sys.call('symlink', pathOf(target), pathOf(path))),
         link: (from: unknown, to: unknown, req?: Request) =>
           dispatch(req, ['link', pathOf(from), pathOf(to)], () => void sys.call('link', pathOf(from), pathOf(to))),
-        // Permissions, ownership and timestamps are not modelled yet: validate the target, then succeed.
-        chmod: (path: unknown, _mode: number, req?: Request) => dispatch(req, ['chmod', pathOf(path)], () => void stat(pathOf(path))),
+        // Modes and times are the kernel's. Ownership isn't modelled (one user): validate the target, then succeed.
+        chmod: (path: unknown, mode: number, req?: Request) => dispatch(req, ['chmod', pathOf(path)], () => void sys.call('chmod', pathOf(path), mode)),
         lchmod: (path: unknown, _mode: number, req?: Request) => dispatch(req, ['lchmod', pathOf(path)], () => void stat(pathOf(path))),
         chown: (path: unknown, _uid: number, _gid: number, req?: Request) => dispatch(req, ['chown', pathOf(path)], () => void stat(pathOf(path))),
         lchown: (path: unknown, _uid: number, _gid: number, req?: Request) => dispatch(req, ['lchown', pathOf(path)], () => void stat(pathOf(path))),
-        utimes: (path: unknown, _atime: number, _mtime: number, req?: Request) => dispatch(req, ['utime', pathOf(path)], () => void stat(pathOf(path))),
-        lutimes: (path: unknown, _atime: number, _mtime: number, req?: Request) => dispatch(req, ['lutime', pathOf(path)], () => void stat(pathOf(path))),
-        fchmod: (fd: number, _mode: number, req?: Request) => dispatch(req, ['fchmod'], () => void sys.call('fstat', fd)),
+        // Node passes times in seconds.
+        utimes: (path: unknown, atime: number, mtime: number, req?: Request) =>
+          dispatch(req, ['utime', pathOf(path)], () => void sys.call('utimes', pathOf(path), atime * 1000, mtime * 1000)),
+        lutimes: (path: unknown, atime: number, mtime: number, req?: Request) =>
+          dispatch(req, ['lutime', pathOf(path)], () => void sys.call('utimes', pathOf(path), atime * 1000, mtime * 1000, AT_FDCWD, false)),
+        fchmod: (fd: number, mode: number, req?: Request) => dispatch(req, ['fchmod'], () => void sys.call('chmod', null, mode, fd)),
         fchown: (fd: number, _uid: number, _gid: number, req?: Request) => dispatch(req, ['fchown'], () => void sys.call('fstat', fd)),
-        futimes: (fd: number, _atime: number, _mtime: number, req?: Request) => dispatch(req, ['futime'], () => void sys.call('fstat', fd)),
+        futimes: (fd: number, atime: number, mtime: number, req?: Request) =>
+          dispatch(req, ['futime'], () => void sys.call('utimes', null, atime * 1000, mtime * 1000, fd)),
         fsync: (fd: number, req?: Request) => dispatch(req, ['fsync'], () => void sys.call('fstat', fd)),
         fdatasync: (fd: number, req?: Request) => dispatch(req, ['fdatasync'], () => void sys.call('fstat', fd)),
       }

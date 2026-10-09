@@ -171,7 +171,7 @@ describe('crypto', () => {
 describe('child_process', () => {
   it('pipes through a child with spawn', async () => {
     const { stdout } = await node("const c = require('child_process').spawn('wc'); c.stdout.pipe(process.stdout); c.stdin.end('one two three\\n')")
-    expect(stdout).toBe('      1       3      14\n')
+    expect(stdout).toBe('        1         3        14\n')
   })
 
   it('reports signals when a child is killed', async () => {

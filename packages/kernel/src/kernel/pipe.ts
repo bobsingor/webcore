@@ -19,6 +19,7 @@ export class Pipe {
   private writeOpen = true
   private readers: Waiter[] = []
   private writers: Waiter[] = []
+  private readonly watchers = new Set<() => void>()
 
   constructor(capacity = 64 * 1024) {
     this.capacity = capacity
@@ -26,6 +27,20 @@ export class Pipe {
 
   get size(): number {
     return this.buffered
+  }
+
+  get readClosed(): boolean {
+    return !this.readOpen
+  }
+
+  get writeClosed(): boolean {
+    return !this.writeOpen
+  }
+
+  /** Calls `listener` on every change (data, room, either end closing), for poll. */
+  watch(listener: () => void): () => void {
+    this.watchers.add(listener)
+    return () => this.watchers.delete(listener)
   }
 
   async read(max: number, signal?: AbortSignal): Promise<Uint8Array> {
@@ -100,5 +115,6 @@ export class Pipe {
 
   private wake(queue: Waiter[]): void {
     for (const waiter of queue.splice(0)) waiter()
+    for (const watcher of [...this.watchers]) watcher()
   }
 }

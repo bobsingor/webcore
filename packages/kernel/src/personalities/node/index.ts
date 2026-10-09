@@ -1,5 +1,6 @@
 // Node.js personality (M1, ADR-0005): Node v24.21.0's own lib/ running over bindings written
 // against the kernel. JavaScript runs on the host engine's JIT.
+import { O_RDWR } from '../../abi/constants.ts'
 import type { BootMessage } from '../../abi/protocol.ts'
 import type { Platform } from '../../process/main.ts'
 import type { SyscallClient } from '../../process/syscalls.ts'
@@ -12,9 +13,25 @@ import { host } from './host.ts'
 const kBootstrapFailure = 10
 const kInvalidCommandLineArgument = 9
 
+/** As Node's PlatformInit: fds 0 to 2 are always open, on /dev/null if they were closed. */
+function openStdio(sys: SyscallClient): void {
+  for (let fd = 0; fd < 3; fd++) {
+    try {
+      sys.call('fstat', fd)
+    } catch {
+      const opened = sys.call('open', '/dev/null', O_RDWR)
+      if (opened !== fd) {
+        sys.call('dup2', opened, fd)
+        sys.call('close', opened)
+      }
+    }
+  }
+}
+
 export function runNodejs(boot: BootMessage, sys: SyscallClient, platform: Platform): void {
   const encoder = new host.TextEncoder()
   const stderr = (text: string) => sys.call('write', 2, encoder.encode(text))
+  if (!boot.thread) openStdio(sys)
   const asset = boot.assets['node-lib']
   if (!asset) throw new Error('the Node standard library (node-lib asset) is not installed')
 

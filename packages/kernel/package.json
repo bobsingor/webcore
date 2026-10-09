@@ -17,8 +17,9 @@
   "devDependencies": {
     "@webcore/node-lib": "workspace:*",
     "@webcore/userland": "workspace:*",
-    "@webcore/wat-bin": "workspace:*",
-    "vitest": "^5.0.3"
+    "@webcore/wasix-bin": "workspace:*",
+    "vitest": "^5.0.3",
+    "wabt": "^1.0.39"
   },
   "dependencies": {
     "pako": "2.1.0"

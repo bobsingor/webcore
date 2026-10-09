@@ -1,15 +1,13 @@
 // The runtime page (ADR-0009, ADR-0017). It runs on its own origin, cross-origin isolated by its
 // own headers, inside an iframe that @webcore/sdk creates. The embedding page never touches the
 // kernel: it gets one MessagePort, and this page answers on it.
-import { installRootfs, Kernel, PreviewBridge } from '@webcore/kernel'
+import { busyboxLinks, installRootfs, Kernel, PreviewBridge } from '@webcore/kernel'
 import { webProcessHost } from '@webcore/kernel/web'
 import nodeLibUrl from '@webcore/node-lib/node-lib.bin?url'
 import { previewOrigin, PROTOCOL_VERSION, RUNTIME_HELLO, RUNTIME_LOADED, type RuntimeHello } from '@webcore/sdk/protocol'
 import userland from '@webcore/userland/userland.json'
-import catUrl from '@webcore/wat-bin/cat.wasm?url'
-import echoUrl from '@webcore/wat-bin/echo.wasm?url'
-import lsUrl from '@webcore/wat-bin/ls.wasm?url'
-import wcUrl from '@webcore/wat-bin/wc.wasm?url'
+import busyboxLinksText from '@webcore/wasix-bin/busybox.links?raw'
+import busyboxUrl from '@webcore/wasix-bin/busybox.wasm?url'
 import { serveRuntime } from './server.ts'
 import { openWorkspace } from './storage.ts'
 
@@ -24,13 +22,7 @@ const NOT_ISOLATED =
 const PREVIEW_ORIGIN = `${location.protocol}//p{port}.localhost${location.port ? `:${location.port}` : ''}`
 
 const download = async (url: string) => new Uint8Array(await (await fetch(url)).arrayBuffer())
-const loadAssets = () =>
-  Promise.all([
-    download(nodeLibUrl),
-    Promise.all(
-      Object.entries({ cat: catUrl, echo: echoUrl, ls: lsUrl, wc: wcUrl }).map(async ([name, url]) => [name, await download(url)] as const),
-    ).then((entries) => Object.fromEntries(entries)),
-  ])
+const loadAssets = () => Promise.all([download(nodeLibUrl), download(busyboxUrl)])
 
 async function start(port: MessagePort, hello: RuntimeHello, assets: ReturnType<typeof loadAssets>): Promise<void> {
   if (!crossOriginIsolated) {
@@ -38,9 +30,9 @@ async function start(port: MessagePort, hello: RuntimeHello, assets: ReturnType<
     return
   }
   try {
-    const [nodeLib, binaries] = await assets
+    const [nodeLib, busybox] = await assets
     const kernel = new Kernel({ host: webProcessHost(), assets: { 'node-lib': nodeLib } })
-    installRootfs(kernel, binaries, userland)
+    installRootfs(kernel, { busybox: { binary: busybox, links: busyboxLinks(busyboxLinksText) }, userland })
     // /home comes back from the workspace's saved state, and is saved as it changes (M2b).
     const workspace = hello.workspace === null ? undefined : await openWorkspace(kernel, hello.workspace || 'default', hello.from)
     const bridge = new PreviewBridge(kernel, { origin: (number) => previewOrigin(PREVIEW_ORIGIN, number) })

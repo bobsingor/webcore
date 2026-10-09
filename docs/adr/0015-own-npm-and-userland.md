@@ -1,6 +1,6 @@
 # 0015. npm and sh are webcore programs; the kernel unpacks packages
 
-- **Status:** Accepted · implemented in M1d
+- **Status:** Accepted · implemented in M1d; sh superseded by BusyBox in M2c ([0020](0020-wasix-personality.md))
 - **Date:** 2026-10-09
 
 ## Context

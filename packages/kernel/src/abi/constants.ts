@@ -9,6 +9,7 @@ export const O_EXCL = 0o200
 export const O_TRUNC = 0o1000
 export const O_APPEND = 0o2000
 export const O_DIRECTORY = 0o200000
+export const O_CLOEXEC = 0o2000000
 
 export const SEEK_SET = 0
 export const SEEK_CUR = 1
@@ -22,6 +23,13 @@ export const S_IFDIR = 0o040000
 export const S_IFREG = 0o100000
 export const S_IFLNK = 0o120000
 export const S_IFSOCK = 0o140000
+
+// poll events
+export const POLLIN = 0x1
+export const POLLOUT = 0x4
+export const POLLERR = 0x8
+export const POLLHUP = 0x10
+export const POLLNVAL = 0x20
 
 export const DEFAULT_PATH = '/usr/bin:/bin'
 

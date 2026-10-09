@@ -2,7 +2,7 @@
   "name": "@webcore/userland",
   "version": "0.0.0",
   "private": true,
-  "description": "webcore's own programs, written in TypeScript for its Node.js: sh, and npm/npx (a package installer).",
+  "description": "webcore's own programs, written in TypeScript for its Node.js: npm and npx (a package installer).",
   "type": "module",
   "exports": {
     "./userland.json": "./dist/userland.json",

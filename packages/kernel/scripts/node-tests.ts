@@ -11,7 +11,7 @@ import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { nodeProcessHost } from '../src/host/node.ts'
-import { DEFAULT_ENV, exec, installRootfs, Kernel } from '../src/index.ts'
+import { busyboxLinks, DEFAULT_ENV, exec, installRootfs, Kernel } from '../src/index.ts'
 
 const NODE_VERSION = 'v24.21.0'
 const TIMEOUT_MS = 60_000
@@ -39,11 +39,13 @@ function fetchTests(): void {
 function boot(): Kernel {
   const kernel = new Kernel({ host: nodeProcessHost({ warmWorkers: CONCURRENCY }) })
   kernel.addAsset('node-lib', new Uint8Array(readFileSync(join(workspace, 'node-lib/dist/node-lib.bin'))))
-  const binDir = join(workspace, 'wat-bin/dist')
-  const binaries = Object.fromEntries(
-    readdirSync(binDir).filter((file) => file.endsWith('.wasm')).map((file) => [file.slice(0, -5), new Uint8Array(readFileSync(join(binDir, file)))]),
-  )
-  installRootfs(kernel, binaries, JSON.parse(readFileSync(join(workspace, 'userland/dist/userland.json'), 'utf8')))
+  installRootfs(kernel, {
+    busybox: {
+      binary: new Uint8Array(readFileSync(join(workspace, 'wasix-bin/dist/busybox.wasm'))),
+      links: busyboxLinks(readFileSync(join(workspace, 'wasix-bin/dist/busybox.links'), 'utf8')),
+    },
+    userland: JSON.parse(readFileSync(join(workspace, 'userland/dist/userland.json'), 'utf8')),
+  })
   // The repository root, as Node's test runner sees it: /node/test/{common,fixtures,parallel}.
   const copy = (from: string, to: string) => {
     kernel.fs.mkdirp(to)

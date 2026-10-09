@@ -43,12 +43,15 @@ importers:
       '@webcore/userland':
         specifier: workspace:*
         version: link:../userland
-      '@webcore/wat-bin':
+      '@webcore/wasix-bin':
         specifier: workspace:*
-        version: link:../wat-bin
+        version: link:../wasix-bin
       vitest:
         specifier: ^5.0.3
         version: 5.0.3(@types/node@22.20.5)(vite@8.3.4(@types/node@22.20.5))
+      wabt:
+        specifier: ^1.0.39
+        version: 1.0.39
 
   packages/node-lib: {}
 
@@ -66,9 +69,9 @@ importers:
       '@webcore/userland':
         specifier: workspace:*
         version: link:../userland
-      '@webcore/wat-bin':
+      '@webcore/wasix-bin':
         specifier: workspace:*
-        version: link:../wat-bin
+        version: link:../wasix-bin
     devDependencies:
       vite:
         specifier: ^8.3.4
@@ -78,11 +81,7 @@ importers:
 
   packages/userland: {}
 
-  packages/wat-bin:
-    devDependencies:
-      wabt:
-        specifier: ^1.0.39
-        version: 1.0.39
+  packages/wasix-bin: {}
 
 packages:
 

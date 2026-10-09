@@ -94,8 +94,11 @@ export interface Syscalls {
    * delivery to its handler.
    */
   kill(pid: number, signal: number): number
-  /** Sets how the caller treats `signal`; returns the previous disposition. SIGKILL can't change. */
-  sigaction(signal: number, action: SignalAction): SignalAction
+  /**
+   * Sets how the caller treats `signal`; returns the previous disposition. SIGKILL can't change.
+   * `restart` (SA_RESTART): a syscall the handled signal interrupts is made again afterwards.
+   */
+  sigaction(signal: number, action: SignalAction, restart?: boolean): SignalAction
   /** Starts a new session and process group led by the caller; EPERM for a group leader. */
   setsid(): number
   /** The session of `pid` (0: the caller). */
@@ -135,6 +138,56 @@ export interface Syscalls {
   threadWait(id: number): number
   /** Stops a thread abruptly (worker.terminate()); it ends with code 1. */
   threadTerminate(id: number): number
+  /** Duplicates `fd` onto the lowest free fd ≥ `min` (F_DUPFD); `cloexec` sets FD_CLOEXEC. */
+  dup(fd: number, min?: number, cloexec?: boolean): number
+  /** Makes `to` another fd for `fd`'s file (dup2), closing what `to` was. FD_CLOEXEC is cleared. */
+  dup2(fd: number, to: number): number
+  /** FD_CLOEXEC of `fd` (1 or 0); sets it first when `cloexec` is given. */
+  fdflags(fd: number, cloexec?: boolean): number
+  /** Sets a file's permission bits: `path` relative to `dirfd`, or the file `dirfd` when null. */
+  chmod(path: string | null, mode: number, dirfd?: number): number
+  /**
+   * Sets a file's access and modification times (ms since the epoch; null keeps one): `path`
+   * relative to `dirfd`, or the file `dirfd` when null. `follow` false changes a link itself.
+   */
+  utimes(path: string | null, atimeMs: number | null, mtimeMs: number | null, dirfd?: number, follow?: boolean): number
+  /**
+   * Readiness of fds, as poll(2): for each [fd, events] the returned [revents, bytes readable].
+   * Waits up to `timeout` ms (negative: no limit) for one to become ready.
+   */
+  poll(fds: [fd: number, events: number][], timeout: number): [revents: number, readable: number][]
+  /**
+   * Starts a child that shares the caller's memory (vfork, M2c): a copy of its fds, working
+   * directory and signal dispositions. The calling thread then acts as the child (its syscalls
+   * apply to the child) until the child calls execve or vforkExit. Returns the child's pid.
+   */
+  vfork(): number
+  /** Ends the vfork child the thread acts as, with `code`; the thread is its parent again. */
+  vforkExit(code: number): number
+  /**
+   * Runs `file` in place of the caller's program, with `argv` and `env`. FD_CLOEXEC fds close and
+   * handled signals return to their default. `search` is a PATH in which to look for a `file`
+   * without a slash. For a vfork child the new program starts in the child's own Worker, and the
+   * call returns in the parent; otherwise it doesn't return.
+   */
+  execve(file: string, argv: string[], env: Record<string, string>, search?: string): number
+  /**
+   * Waits for a child to change state, as wait4(2): `pid` is a child, -1 any child, 0 any in the
+   * caller's group, or -group. `options` are WNOHANG, WUNTRACED and WCONTINUED. Returns the child
+   * and its status in Linux's encoding, or [0, 0] with WNOHANG when none has changed.
+   */
+  wait4(pid: number, options: number): [pid: number, status: number]
+  /** The process group of `pid` (0: the caller). */
+  getpgid(pid: number): number
+  /** Sets the file creation mask (unless null); returns the previous one. */
+  umask(mask: number | null): number
+  /** Waits until a signal interrupts it (EINTR). */
+  pause(): number
+  /**
+   * Takes the signals waiting for the caller's handlers, in arrival order (WASI processes, between
+   * syscalls). Waits while the caller is stopped.
+   */
+  takeSignals(): number[]
   /**
    * Watches a file or directory (like inotify). Reading the returned fd blocks until changes arrive,
    * as newline-separated JSON: {"event": "rename" | "change", "path": relative name}.

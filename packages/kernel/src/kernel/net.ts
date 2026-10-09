@@ -6,7 +6,7 @@ import { kerr } from '../abi/errno.ts'
 import { O_RDWR, S_IFSOCK } from '../abi/constants.ts'
 import type { AddressFamily, SocketAddress } from '../abi/syscalls.ts'
 import type { EventBus } from './events.ts'
-import { OpenFile, pseudoStat } from './files.ts'
+import { OpenFile, pseudoStat, type Readiness } from './files.ts'
 import { Pipe } from './pipe.ts'
 
 // Linux's default ip_local_port_range.
@@ -66,6 +66,22 @@ export class Socket extends OpenFile {
     return this.outgoing.write(data, signal)
   }
 
+  override readiness(): Readiness {
+    const incoming = this.incoming
+    const hangup = incoming.writeClosed
+    return {
+      read: incoming.size > 0 || hangup,
+      write: this.outgoing.readClosed || this.outgoing.size < this.outgoing.capacity,
+      hangup,
+      bytes: incoming.size,
+    }
+  }
+
+  override watchReadiness(listener: () => void): () => void {
+    const stops = [this.incoming.watch(listener), this.outgoing.watch(listener)]
+    return () => stops.forEach((stop) => stop())
+  }
+
   /** Closes the write direction (SHUT_WR): the peer reads EOF, and reading here continues. */
   shutdown(): void {
     this.outgoing.closeWrite()
@@ -94,6 +110,7 @@ export class Listener extends OpenFile {
   private readonly network: Network
   private readonly queue: Socket[] = []
   private readonly waiters: AcceptWaiter[] = []
+  private readonly watchers = new Set<() => void>()
   private open = true
 
   constructor(network: Network, local: SocketAddress, pid: number) {
@@ -131,6 +148,17 @@ export class Listener extends OpenFile {
     const waiter = this.waiters.shift()
     if (waiter) waiter.resolve(socket)
     else this.queue.push(socket)
+    for (const watcher of [...this.watchers]) watcher()
+  }
+
+  /** Readable when a connection waits to be accepted. */
+  override readiness(): Readiness {
+    return { read: this.queue.length > 0 || !this.open, write: false, hangup: false, bytes: 0 }
+  }
+
+  override watchReadiness(listener: () => void): () => void {
+    this.watchers.add(listener)
+    return () => this.watchers.delete(listener)
   }
 
   stat() {

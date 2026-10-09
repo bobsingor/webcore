@@ -3,7 +3,7 @@
 import { serialize } from 'node:v8'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { Kernel } from '../src/index.ts'
-import { boot, sh } from './helpers.ts'
+import { boot, sh, wasiFixtures } from './helpers.ts'
 
 let kernel: Kernel
 
@@ -101,6 +101,7 @@ describe('worker_threads', () => {
 
 describe('node:wasi', () => {
   it('runs WASI programs with preopened directories', async () => {
+    for (const [name, bytes] of Object.entries(await wasiFixtures())) kernel.fs.writeFile(`/usr/bin/${name}`, bytes, 0o755)
     const { stdout } = await run(
       'wasi.js',
       `const { WASI } = require('node:wasi')
@@ -111,9 +112,9 @@ describe('node:wasi', () => {
         return wasi.start(instance)
       }
       fs.writeFileSync('note.txt', 'read through a preopen\\n')
-      console.log('echo exit', run('/usr/bin/echo', ['echo', 'hello', 'from', 'wasi']))
-      console.log('cat exit', run('/usr/bin/cat', ['cat', '/note.txt']))
-      console.log('missing exit', run('/usr/bin/cat', ['cat', '/missing.txt']))`,
+      console.log('echo exit', run('/usr/bin/wasi-echo', ['echo', 'hello', 'from', 'wasi']))
+      console.log('cat exit', run('/usr/bin/wasi-cat', ['cat', '/note.txt']))
+      console.log('missing exit', run('/usr/bin/wasi-cat', ['cat', '/missing.txt']))`,
     )
     expect(stdout).toBe('hello from wasi\necho exit 0\nread through a preopen\ncat exit 0\nmissing exit 1\n')
   })

@@ -61,7 +61,7 @@ describe('runtime files', () => {
 describe('runtime processes', () => {
   it('runs commands and collects their output', async () => {
     expect(await runtime.exec(['node', '-p', '6 * 7'])).toEqual({ code: 0, stdout: '42\n', stderr: '' })
-    expect(await runtime.exec(['wc'], { stdin: 'four' })).toMatchObject({ code: 0, stdout: '      0       1       4\n' })
+    expect(await runtime.exec(['wc'], { stdin: 'four' })).toMatchObject({ code: 0, stdout: '        0         1         4\n' })
     await expect(runtime.exec(['no-such-command'])).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
@@ -94,7 +94,7 @@ describe('runtime processes', () => {
     expect(session.cwd).toBe('/tmp/w')
     expect(session.env.GREETING).toBe('hi')
     expect(await session.run('pwd && echo $GREETING | wc', { onStdout })).toBe(0)
-    expect(out).toBe('/tmp/w\n      1       1       3\n')
+    expect(out).toBe('/tmp/w\n        1         1         3\n')
     expect(await session.run('node -e "process.exit(3)"')).toBe(3)
   })
 })

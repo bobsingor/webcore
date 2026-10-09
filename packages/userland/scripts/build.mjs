@@ -12,7 +12,6 @@ const PREFIX = '/usr/lib/webcore'
 
 // Executables: VFS path → module (relative to src).
 const LINKS = {
-  '/bin/sh': 'sh/main.ts',
   '/usr/bin/npm': 'npm/bin/npm.ts',
   '/usr/bin/npx': 'npm/bin/npx.ts',
 }

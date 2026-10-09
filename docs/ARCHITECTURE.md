@@ -84,7 +84,7 @@ the file's header.
 
 | Personality | Detects | Runs | ADR |
 |---|---|---|---|
-| WASI / WASIX | `\0asm` magic | Any binary built for `wasm32-wasi(p1)`; WASIX extensions add fork/exec, sockets, signals, threads | [0004](adr/0004-wasi-and-wasix-abi.md) |
+| WASI / WASIX | `\0asm` magic | Any binary built for `wasm32-wasi(p1)`; WASIX adds vfork/exec, signals, terminals, pipes (and, not mapped yet, sockets and threads) | [0004](adr/0004-wasi-and-wasix-abi.md), [0020](adr/0020-wasix-personality.md) |
 | JS (Node) | `#!personality:node` | JavaScript on the host JIT, with Node's built-in modules implemented over kernel syscalls | [0005](adr/0005-js-on-the-host-engine.md) |
 | Emscripten adapter | Emscripten glue + wasm | Pyodide, PGlite, php-wasm, existing ports, with their FS/syscall layer redirected to the kernel | [0004](adr/0004-wasi-and-wasix-abi.md) |
 | VM (later, optional) | ELF magic | Unmodified binaries through a CPU emulator (v86-style). Slow, but an escape hatch for the long tail | — |
@@ -178,8 +178,8 @@ Each milestone has a concrete exit criterion.
 |---|---|---|
 | **M0** | **Kernel spike** ✅ | A JS process and a WASI binary pipe into each other through synchronous syscalls, in the browser and headless in Node |
 | **M1** | **Flagship** ✅ ([plan](milestones/M1.md)) | `npm create vite` → `npm install` → `npm run dev` with a live preview |
-| **M2** | **Shell and state** (now, [plan](milestones/M2.md)) | bash/BusyBox via WASIX, PTY + xterm.js, CoW VFS with snapshot/restore |
-| M3 | Second runtime | Python + PGlite on the same kernel (forces the kernel to stay language-neutral) |
+| **M2** | **Shell and state** ✅ ([plan](milestones/M2.md)) | BusyBox via WASIX, PTY + xterm.js, job control, CoW VFS with snapshot/restore |
+| M3 | Second runtime (next) | Python + PGlite on the same kernel (forces the kernel to stay language-neutral) |
 | M4 | Agents | Host SDK + MCP server, headless package, public compatibility dashboard |
 | M5 | Studio | Tutorial/replay layer as a separate package consuming events and snapshots |
 

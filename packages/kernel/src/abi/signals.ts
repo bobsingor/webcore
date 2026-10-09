@@ -1,5 +1,6 @@
 // Signals, in Linux's numbering (ADR-0003). A process chooses, per signal, the default action,
-// ignoring it, or handling it; handled signals are delivered over the process's message port.
+// ignoring it, or handling it. Handled signals reach a Node process over its message port, and a
+// WASI process between syscalls (ADR-0020).
 
 export const SIGHUP = 1
 export const SIGINT = 2
@@ -11,6 +12,8 @@ export const SIGCHLD = 17
 export const SIGCONT = 18
 export const SIGSTOP = 19
 export const SIGTSTP = 20
+export const SIGTTIN = 21
+export const SIGTTOU = 22
 export const SIGWINCH = 28
 
 export const SIGNAL_NAMES: Record<number, string> = {
@@ -50,17 +53,19 @@ export const SIGNAL_NAMES: Record<number, string> = {
 /** Signals whose default action is to do nothing. */
 const IGNORED_BY_DEFAULT = new Set([SIGCHLD, SIGCONT, 23 /* SIGURG */, SIGWINCH])
 
-/**
- * Signals whose default action stops the process. There is no job control yet (M2c), so they are
- * ignored for now.
- */
-const STOP_BY_DEFAULT = new Set([SIGSTOP, SIGTSTP, 21 /* SIGTTIN */, 22 /* SIGTTOU */])
+/** Signals whose default action stops the process (job control). */
+const STOP_BY_DEFAULT = new Set([SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU])
 
 export type SignalAction = 'default' | 'ignore' | 'handle'
 
-/** What the default action of `signal` does here: terminate the process, or nothing. */
+/** Whether the default action of `signal` terminates the process. */
 export function defaultTerminates(signal: number): boolean {
   return !IGNORED_BY_DEFAULT.has(signal) && !STOP_BY_DEFAULT.has(signal)
+}
+
+/** Whether the default action of `signal` stops the process. */
+export function defaultStops(signal: number): boolean {
+  return STOP_BY_DEFAULT.has(signal)
 }
 
 export function isValidSignal(signal: number): boolean {
@@ -89,6 +94,19 @@ export interface Termios {
 export interface WinSize {
   rows: number
   cols: number
+}
+
+// wait4 options and status encoding (as Linux's)
+export const WNOHANG = 1
+export const WUNTRACED = 2
+export const WCONTINUED = 8
+
+/** A wait status: exited with `code`, killed by `signal`, stopped by `stopped`, or continued. */
+export function waitStatus(state: { code?: number; signal?: number; stopped?: number; continued?: boolean }): number {
+  if (state.continued) return 0xffff
+  if (state.stopped !== undefined) return ((state.stopped & 0xff) << 8) | 0x7f
+  if (state.signal !== undefined) return state.signal & 0x7f
+  return ((state.code ?? 0) & 0xff) << 8
 }
 
 // ioctl requests (asm-generic/ioctls.h)

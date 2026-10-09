@@ -1,7 +1,8 @@
-// M2a: pseudo-terminals, signals, Node on a TTY, the interactive shell and Node's REPL.
-// Expected behaviour is Linux's (n_tty) and real Node's.
+// Pseudo-terminals, signals, Node on a TTY and Node's REPL (M2a); the interactive shell, BusyBox's
+// hush, with line editing and job control (M2c). Expected behaviour is Linux's (n_tty) and real
+// Node's.
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { DEFAULT_ENV, ICANON, ECHO, TCGETS, type Kernel, type PtyMaster } from '../src/index.ts'
+import { DEFAULT_ENV, ECHO, exec, ICANON, TCGETS, type Kernel, type PtyMaster } from '../src/index.ts'
 import { boot, sh } from './helpers.ts'
 
 let kernel: Kernel
@@ -126,16 +127,16 @@ describe('pseudo-terminals', () => {
 
 describe('signals', () => {
   it('delivers handled signals and takes default actions otherwise', async () => {
-    const { stdout, code } = await sh(
-      kernel,
-      `node -e "
-        process.on('SIGUSR1', (name) => console.log('handled', name))
-        process.kill(process.pid, 'SIGUSR1')
-        const onTerm = () => { console.log('handled SIGTERM'); process.off('SIGTERM', onTerm); process.kill(process.pid, 'SIGTERM') }
-        setTimeout(() => { process.on('SIGTERM', onTerm); process.kill(process.pid, 'SIGTERM') }, 20)
-        setInterval(() => {}, 1000)
-      "`,
-    )
+    // Without a shell, which would report the job's end ("Terminated").
+    const { stdout, code } = await exec(kernel, [
+      'node',
+      '-e',
+      `process.on('SIGUSR1', (name) => console.log('handled', name))
+      process.kill(process.pid, 'SIGUSR1')
+      const onTerm = () => { console.log('handled SIGTERM'); process.off('SIGTERM', onTerm); process.kill(process.pid, 'SIGTERM') }
+      setTimeout(() => { process.on('SIGTERM', onTerm); process.kill(process.pid, 'SIGTERM') }, 20)
+      setInterval(() => {}, 1000)`,
+    ])
     expect(stdout).toBe('handled SIGUSR1\nhandled SIGTERM\n')
     expect(code).toBe(143)
   })
@@ -174,8 +175,8 @@ describe('interactive sh', () => {
     term.type('\x04')
     await term.waitFor(/typed into cat\nuser@webcore:\/tmp\$ $/)
     // A pipeline is one job, even when its first stage ends before the last one starts.
-    term.type('/usr/bin/echo one two | wc | cat\r')
-    await term.waitFor('      1       2       8\n')
+    term.type('/bin/echo one two | wc | cat\r')
+    await term.waitFor('        1         2         8\n')
     // An incomplete line asks for more (PS2).
     term.type('if true\r')
     await term.waitFor(/> $/)
@@ -190,7 +191,87 @@ describe('interactive sh', () => {
     await term.waitFor('$ ')
     term.type('\x04')
     expect(await term.proc.exited).toBe(0)
-    expect(term.text()).toMatch(/exit\n$/)
+  })
+
+  it('stops a job with ^Z, and continues it with bg and fg', async () => {
+    const term = terminal(['sh'])
+    await term.waitFor('$ ')
+    term.type('node -e "let n = 0; setInterval(() => console.log(\'tick\', ++n), 100)"\r')
+    await term.waitFor('tick 2')
+    term.type('\x1a')
+    await term.waitFor(/\^Z.*\n.*\$ $/)
+    term.type('jobs\r')
+    await term.waitFor(/\[1\]\+? +Stopped +node -e.*\n.*\$ $/)
+    // Stopped: its output stops too.
+    const stopped = term.text().length
+    await new Promise((resolve) => setTimeout(resolve, 400))
+    expect(term.text().length).toBe(stopped)
+    term.type('bg\r')
+    await term.waitFor(/tick \d+\n[\s\S]*tick \d+\n/)
+    term.type('jobs\r')
+    await term.waitFor(/\[1\]\+? +Running +node -e/)
+    term.type('fg\r')
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    term.type('\x03')
+    await term.waitFor(/\^C\n.*\$ $/)
+    term.type('echo status $?; jobs\r')
+    await term.waitFor(/status 130\n.*\$ $/)
+    term.type('exit\r')
+    expect(await term.proc.exited).toBe(0)
+  })
+
+  it('hangs up the stopped jobs of a shell that exits', async () => {
+    const term = terminal(['sh'])
+    await term.waitFor('$ ')
+    term.type('sleep 100\r')
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    term.type('\x1a')
+    await term.waitFor(/\^Z.*sleep 100\n.*\$ $/)
+    term.type('exit\r')
+    expect(await term.proc.exited).toBe(0)
+    // The stopped job's group is orphaned: SIGHUP, then SIGCONT, end it.
+    while (kernel.processes.some((proc) => proc.alive)) await new Promise((resolve) => setTimeout(resolve, 10))
+  })
+
+  it('edits lines, recalls history and completes paths', async () => {
+    const term = terminal(['sh'])
+    await term.waitFor('$ ')
+    term.type('echo first\r')
+    await term.waitFor('first\n')
+    // Up recalls the last line; Left moves the cursor into it.
+    term.type('\x1b[A\x1b[D\x1b[D\x1b[D\x1b[D\x1b[D-\r')
+    await term.waitFor('-first\n')
+    term.type('ls /et\t')
+    await term.waitFor('ls /etc/')
+    term.type('\r')
+    await term.waitFor('motd')
+    term.type('exit\r')
+    expect(await term.proc.exited).toBe(0)
+  })
+
+  it('runs vi and less full-screen', async () => {
+    const term = terminal(['sh'])
+    await term.waitFor('$ ')
+    term.type('vi notes.txt\r')
+    // vi's status line.
+    await term.waitFor('- notes.txt 1/1')
+    term.type('ihello from vi')
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    // Escape alone (no sequence follows) leaves insert mode.
+    term.type('\x1b')
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    term.type(':wq\r')
+    await term.waitFor("'notes.txt' 1L, 14C")
+    expect(new TextDecoder().decode(kernel.fs.readFile('/home/user/notes.txt'))).toBe('hello from vi\n')
+    term.type('seq 1 100 | less\r')
+    await term.waitFor(/^29$/m)
+    term.type(' ')
+    await term.waitFor(/^58$/m)
+    term.type('q')
+    term.type('echo done\r')
+    await term.waitFor('done\n')
+    term.type('exit\r')
+    expect(await term.proc.exited).toBe(0)
   })
 })
 

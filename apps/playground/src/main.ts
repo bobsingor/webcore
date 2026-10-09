@@ -109,17 +109,17 @@ async function editApp(runtime: Runtime): Promise<string> {
 const EXAMPLES: Example[] = [
   { label: 'Real Node.js', command: `node -p "process.version + ' on ' + process.platform + ', ' + require('module').builtinModules.length + ' builtin modules'"` },
   {
-    label: 'WASI → Node → WASI pipeline',
+    label: 'BusyBox → Node → BusyBox pipeline',
     command: `echo hello webcore | node -e "process.stdin.on('data', d => process.stdout.write(d.toString().toUpperCase()))" | wc`,
   },
   {
-    label: 'Node spawns a WASI child',
+    label: 'Node spawns a C program',
     command: `node -e "const c = require('child_process').spawn('wc'); c.stdout.pipe(process.stdout); c.stdin.end('one two three\\n')"`,
   },
-  { label: 'Read a file (WASI)', command: 'cat /etc/motd' },
-  { label: 'List a directory (WASI)', command: 'ls /usr/bin' },
+  { label: 'grep, sed and awk', command: `ls -l /bin | grep -c busybox; seq 5 | awk '{ s += $1 } END { print "sum", s }' | sed 's/sum/total:/'` },
+  { label: 'Job control (Ctrl+Z, fg)', command: `sleep 30 & jobs; kill %1; wait; echo "Ctrl+Z stops the foreground job; fg and bg continue it"` },
   {
-    label: 'Node writes, WASI reads',
+    label: 'Node writes, BusyBox reads',
     command: `node -e "require('fs').writeFileSync('note.txt', 'written by node at ' + new Date().toISOString() + '\\n')" && cat note.txt`,
   },
   {
@@ -190,6 +190,8 @@ function describeEvent(event: RuntimeEvent): string {
   switch (event.type) {
     case 'process.spawn':
       return `spawn  pid ${event.pid}  ${event.argv.join(' ').slice(0, 60)}`
+    case 'process.exec':
+      return `exec   pid ${event.pid}  ${event.argv.join(' ').slice(0, 60)}`
     case 'process.exit':
       return `exit   pid ${event.pid}  → ${event.code}`
     case 'fs.change':

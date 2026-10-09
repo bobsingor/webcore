@@ -1,3 +1,4 @@
+import type { MemoryImport } from '../kernel/wasm.ts'
 import type { SyscallName, SyscallValue } from './syscalls.ts'
 
 /** Process → kernel. `sync` requests are answered through the syscall page (ADR-0002). */
@@ -30,6 +31,10 @@ export interface BootMessage {
   execPath: string
   personality: Personality
   module?: WebAssembly.Module
+  /** The memory the module imports, which the process creates (WASIX programs share theirs). */
+  memory?: MemoryImport
+  /** Signals the program starts out ignoring, inherited through exec (WASI processes). */
+  ignored?: number[]
   /** Read-only data shared by every process, e.g. the Node standard library (ADR-0012). */
   assets: Record<string, Uint8Array>
   page: SharedArrayBuffer

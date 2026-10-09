@@ -1,9 +1,11 @@
 // wasi_snapshot_preview1 (ADR-0004) on kernel syscalls, shared by the WASI personality and by
-// Node's node:wasi. WASI fds are a table of their own, mapped onto the process's kernel fds, so a
-// module inside a Node process doesn't collide with Node's own open files.
+// Node's node:wasi. Which kernel fd a WASI fd names is up to an Fds table: node:wasi keeps a table
+// of its own, so a module inside a Node process doesn't collide with Node's open files; a WASI
+// process uses the kernel's fds as they are (ADR-0020).
 import {
   AT_FDCWD,
   O_APPEND,
+  O_CLOEXEC,
   O_CREAT,
   O_DIRECTORY,
   O_EXCL,
@@ -11,17 +13,24 @@ import {
   O_RDWR,
   O_TRUNC,
   O_WRONLY,
+  POLLHUP,
+  POLLIN,
+  POLLOUT,
   SEEK_CUR,
 } from '../../abi/constants.ts'
 import type { Dirent, FileType, Stat } from '../../abi/constants.ts'
 import { Errno } from '../../abi/errno.ts'
+import { TCGETS } from '../../abi/signals.ts'
 import { SysError, type SyscallClient } from '../../process/syscalls.ts'
+import { encodeBytes } from './bytes.ts'
 
 // WASI errno values.
-const SUCCESS = 0
-const WASI_EBADF = 8
-const WASI_EIO = 29
-const WASI_ENOSYS = 52
+export const SUCCESS = 0
+export const WASI_EBADF = 8
+export const WASI_EINTR = 27
+export const WASI_EINVAL = 28
+export const WASI_EIO = 29
+export const WASI_ENOSYS = 52
 
 const LINUX_TO_WASI = new Map<number, number>([
   [Errno.E2BIG, 1],
@@ -61,9 +70,16 @@ const LINUX_TO_WASI = new Map<number, number>([
   [Errno.EXDEV, 75],
 ])
 
+/** A kernel errno in WASI's numbering. */
+export function wasiErrno(linux: number): number {
+  return LINUX_TO_WASI.get(linux) ?? WASI_EIO
+}
+
 const FILETYPE: Record<FileType, number> = { chardev: 2, dir: 3, file: 4, fifo: 0, socket: 6, symlink: 7 }
 
+const RIGHT_FD_SEEK = 1n << 2n
 const RIGHT_FD_READ = 1n << 1n
+const RIGHT_FD_TELL = 1n << 5n
 const RIGHT_FD_WRITE = 1n << 6n
 const ALL_RIGHTS = 0x1fffffffn
 
@@ -74,75 +90,158 @@ const OFLAG_EXCL = 4
 const OFLAG_TRUNC = 8
 const FDFLAG_APPEND = 1
 
+const FSTFLAG_ATIM = 1
+const FSTFLAG_ATIM_NOW = 2
+const FSTFLAG_MTIM = 4
+const FSTFLAG_MTIM_NOW = 8
+
 const CLOCK_REALTIME = 0
 const EVENTTYPE_CLOCK = 0
+const EVENTTYPE_FD_READ = 1
+const EVENTTYPE_FD_WRITE = 2
+const EVENT_FD_READWRITE_HANGUP = 1
+
+/** Which kernel fd each WASI fd is. */
+export interface Fds {
+  /** The kernel fd behind `fd` (EBADF when there is none). */
+  kernel(fd: number): number
+  /** Where a path relative to `fd` leads: [kernel dirfd, path]. */
+  at(fd: number, path: string): [dirfd: number, path: string]
+  /** Takes a kernel fd the module opened; returns the fd the module sees. */
+  add(kernelFd: number): number
+  close(fd: number): void
+  /** fd_renumber. */
+  renumber(from: number, to: number): void
+  /** A preopened directory's name; null for an fd the preopen scan should skip; else undefined. */
+  prestat(fd: number): Uint8Array | null | undefined
+  /** Closes every fd the module opened. */
+  closeAll(): void
+}
+
+/**
+ * A table of its own (node:wasi): stdio maps onto the given kernel fds, preopens follow from fd 3,
+ * and files the module opens get the next free numbers.
+ */
+export function tableFds(sys: SyscallClient, preopens: [name: string, path: string][], stdio: [number, number, number], ownsStdio: boolean): Fds {
+  const encoder = new TextEncoder()
+  const table = new Map<number, number>(stdio.map((fd, i) => [i, fd]))
+  const names = new Map<number, Uint8Array>()
+  for (const [name, path] of preopens) {
+    try {
+      const fd = 3 + names.size
+      table.set(fd, sys.call('open', path, O_RDONLY | O_DIRECTORY, 0, AT_FDCWD))
+      names.set(fd, encoder.encode(name))
+    } catch {
+      // A missing directory is simply not preopened.
+    }
+  }
+  const kernel = (fd: number): number => {
+    const kernelFd = table.get(fd)
+    if (kernelFd === undefined) throw new SysError(Errno.EBADF, 'wasi')
+    return kernelFd
+  }
+  // Closing stdio closes the kernel's fds only when the module owns the process.
+  const closeKernel = (fd: number, kernelFd: number) => {
+    if (fd > 2 || ownsStdio) sys.call('close', kernelFd)
+  }
+  return {
+    kernel,
+    at: (fd, path) => [kernel(fd), path],
+    add(kernelFd) {
+      let fd = 3
+      while (table.has(fd)) fd++
+      table.set(fd, kernelFd)
+      return fd
+    },
+    close(fd) {
+      closeKernel(fd, kernel(fd))
+      table.delete(fd)
+      names.delete(fd)
+    },
+    renumber(from, to) {
+      const kernelFd = kernel(from)
+      const replaced = table.get(to)
+      if (replaced !== undefined) closeKernel(to, replaced)
+      table.set(to, kernelFd)
+      table.delete(from)
+      names.delete(to)
+    },
+    prestat: (fd) => names.get(fd),
+    closeAll() {
+      for (const [fd, kernelFd] of table) {
+        try {
+          closeKernel(fd, kernelFd)
+        } catch {
+          // Already closed.
+        }
+      }
+      table.clear()
+    },
+  }
+}
+
+/** Linux open flags for path_open's oflags, rights and fdflags. */
+export function openFlags(oflags: number, rightsBase: bigint, fdflags: number): number {
+  const read = (rightsBase & RIGHT_FD_READ) !== 0n
+  const write = (rightsBase & RIGHT_FD_WRITE) !== 0n
+  let flags = write ? (read ? O_RDWR : O_WRONLY) : O_RDONLY
+  if (oflags & OFLAG_CREAT) flags |= O_CREAT
+  if (oflags & OFLAG_DIRECTORY) flags = (flags & ~O_RDWR & ~O_WRONLY) | O_DIRECTORY
+  if (oflags & OFLAG_EXCL) flags |= O_EXCL
+  if (oflags & OFLAG_TRUNC) flags |= O_TRUNC
+  if (fdflags & FDFLAG_APPEND) flags |= O_APPEND
+  return flags
+}
 
 export interface Preview1Options {
   sys: SyscallClient
   args: string[]
   /** KEY=value strings. */
   env: string[]
-  /** Directories the module may use: [name it sees, path in the VFS]. They become fds 3, 4, … */
-  preopens: [name: string, path: string][]
-  /** Kernel fds behind WASI fds 0, 1 and 2. */
-  stdio: [number, number, number]
-  /** Whether fd_close on 0-2 closes the kernel fds (only when the module owns the process). */
-  ownsStdio: boolean
+  fds: Fds
   memory(): WebAssembly.Memory
   exit(code: number): never
+  /** Sleeps up to `ms`; returns false when a signal cut it short. Default: Atomics.wait. */
+  sleep?(ms: number): boolean
+  /** Called with each stat a filestat call returns (the WASIX personality reports modes). */
+  onStat?(stat: Stat): void
 }
 
+export type Imports = Record<string, (...args: never[]) => number | bigint | void>
+
 export interface Preview1 {
-  imports: Record<string, (...args: never[]) => number | void>
+  imports: Imports
+  /** Runs a syscall-backed operation, translating kernel errors into WASI errno values. */
+  guard(fn: () => void): number
   /** Closes every kernel fd the module opened. */
   close(): void
 }
 
-export function createPreview1(options: Preview1Options): Preview1 {
-  const { sys } = options
+/** node:wasi's preview1: a table of the module's own fds. */
+export function createPreview1(
+  options: Omit<Preview1Options, 'fds'> & { preopens: [string, string][]; stdio: [number, number, number]; ownsStdio: boolean },
+): Preview1 {
+  return preview1({ ...options, fds: tableFds(options.sys, options.preopens, options.stdio, options.ownsStdio) })
+}
+
+export function preview1(options: Preview1Options): Preview1 {
+  const { sys, fds } = options
   const encoder = new TextEncoder()
   const decoder = new TextDecoder()
-  const args = options.args.map((arg) => encoder.encode(`${arg}\0`))
-  const environ = options.env.map((entry) => encoder.encode(`${entry}\0`))
-
-  /** WASI fd → kernel fd. */
-  const table = new Map<number, number>(options.stdio.map((fd, i) => [i, fd]))
-  const preopens = new Map<number, Uint8Array>()
-  for (const [name, path] of options.preopens) {
-    try {
-      const fd = 3 + preopens.size
-      table.set(fd, sys.call('open', path, O_RDONLY | O_DIRECTORY, 0, AT_FDCWD))
-      preopens.set(fd, encoder.encode(name))
-    } catch {
-      // A missing directory is simply not preopened.
-    }
-  }
-  const kfd = (fd: number): number => {
-    const kernelFd = table.get(fd)
-    if (kernelFd === undefined) throw new SysError(Errno.EBADF, 'wasi')
-    return kernelFd
-  }
-  /** The kernel fd for a path lookup's directory fd. */
-  const dir = (fd: number) => kfd(fd)
-  const allocate = (kernelFd: number): number => {
-    let fd = 3
-    while (table.has(fd)) fd++
-    table.set(fd, kernelFd)
-    return fd
-  }
+  const args = options.args.map((arg) => encodeBytes(`${arg}\0`))
+  const environ = options.env.map((entry) => encodeBytes(`${entry}\0`))
 
   const view = () => new DataView(options.memory().buffer)
   const bytes = () => new Uint8Array(options.memory().buffer)
   const readString = (ptr: number, len: number) => decoder.decode(bytes().slice(ptr, ptr + len))
   const directoryListings = new Map<number, Dirent[]>()
 
-  /** Runs a syscall-backed operation, translating errors into WASI errno values. */
   const guard = (fn: () => void): number => {
     try {
       fn()
       return SUCCESS
     } catch (error) {
-      if (error instanceof SysError) return LINUX_TO_WASI.get(error.errno) ?? WASI_EIO
+      if (error instanceof SysError) return wasiErrno(error.errno)
       throw error
     }
   }
@@ -187,6 +286,7 @@ export function createPreview1(options: Preview1Options): Preview1 {
   }
 
   const writeFilestat = (ptr: number, stat: Stat): void => {
+    options.onStat?.(stat)
     const dv = view()
     const ns = (ms: number) => BigInt(Math.round(ms * 1e6))
     dv.setBigUint64(ptr, 1n, true)
@@ -197,6 +297,12 @@ export function createPreview1(options: Preview1Options): Preview1 {
     dv.setBigUint64(ptr + 40, ns(stat.atimeMs), true)
     dv.setBigUint64(ptr + 48, ns(stat.mtimeMs), true)
     dv.setBigUint64(ptr + 56, ns(stat.ctimeMs), true)
+  }
+
+  const fstat = (fd: number): Stat => {
+    const [dirfd, path] = fds.at(fd, '.')
+    // A preopen without a kernel fd of its own is a path.
+    return dirfd === AT_FDCWD ? sys.call('stat', path) : sys.call('fstat', fds.kernel(fd))
   }
 
   const writeSizes = (list: Uint8Array[], countPtr: number, sizePtr: number): number => {
@@ -220,7 +326,9 @@ export function createPreview1(options: Preview1Options): Preview1 {
       ? BigInt(Math.round((performance.timeOrigin + performance.now()) * 1e6))
       : BigInt(Math.round(performance.now() * 1e6))
 
-  const wasi: Record<string, (...args: never[]) => number | void> = {
+  const sleep = options.sleep ?? ((ms: number) => (Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms), true))
+
+  const wasi: Imports = {
     args_sizes_get: (countPtr: number, sizePtr: number) => writeSizes(args, countPtr, sizePtr),
     args_get: (ptrsPtr: number, bufPtr: number) => writeList(args, ptrsPtr, bufPtr),
     environ_sizes_get: (countPtr: number, sizePtr: number) => writeSizes(environ, countPtr, sizePtr),
@@ -245,70 +353,82 @@ export function createPreview1(options: Preview1Options): Preview1 {
     },
 
     fd_write: (fd: number, iovs: number, count: number, nwrittenPtr: number) =>
-      guard(() => view().setUint32(nwrittenPtr, sys.call('write', kfd(fd), gather(iovs, count)), true)),
+      guard(() => view().setUint32(nwrittenPtr, sys.call('write', fds.kernel(fd), gather(iovs, count)), true)),
 
     fd_read: (fd: number, iovs: number, count: number, nreadPtr: number) =>
       guard(() => {
-        const data = sys.call('read', kfd(fd), Math.min(iovecTotal(iovs, count), sys.maxPayload))
+        const data = sys.call('read', fds.kernel(fd), Math.min(iovecTotal(iovs, count), sys.maxPayload))
         scatter(iovs, count, data)
         view().setUint32(nreadPtr, data.length, true)
       }),
 
     fd_close: (fd: number) =>
       guard(() => {
-        const kernelFd = kfd(fd)
-        if (fd > 2 || options.ownsStdio) sys.call('close', kernelFd)
-        table.delete(fd)
-        preopens.delete(fd)
+        fds.close(fd)
         directoryListings.delete(fd)
       }),
 
     fd_renumber: (from: number, to: number) =>
       guard(() => {
-        const kernelFd = kfd(from)
-        const replaced = table.get(to)
-        if (replaced !== undefined && (to > 2 || options.ownsStdio)) sys.call('close', replaced)
-        table.set(to, kernelFd)
-        table.delete(from)
-        preopens.delete(to)
+        fds.renumber(from, to)
         directoryListings.delete(to)
       }),
 
     fd_seek: (fd: number, offset: bigint, whence: number, newOffsetPtr: number) =>
-      guard(() => view().setBigUint64(newOffsetPtr, BigInt(sys.call('seek', kfd(fd), Number(offset), whence)), true)),
+      guard(() => view().setBigUint64(newOffsetPtr, BigInt(sys.call('seek', fds.kernel(fd), Number(offset), whence)), true)),
 
     fd_tell: (fd: number, outPtr: number) =>
-      guard(() => view().setBigUint64(outPtr, BigInt(sys.call('seek', kfd(fd), 0, SEEK_CUR)), true)),
+      guard(() => view().setBigUint64(outPtr, BigInt(sys.call('seek', fds.kernel(fd), 0, SEEK_CUR)), true)),
 
     fd_fdstat_get: (fd: number, ptr: number) =>
       guard(() => {
-        const stat = sys.call('fstat', kfd(fd))
+        const stat = fstat(fd)
+        let rights = ALL_RIGHTS
+        // libc's isatty: a character device that can't seek is a terminal.
+        if (stat.type !== 'file' && stat.type !== 'dir') {
+          let terminal = stat.type === 'chardev'
+          if (terminal) {
+            try {
+              sys.call('ioctl', fds.kernel(fd), TCGETS)
+            } catch {
+              terminal = false
+            }
+          }
+          if (terminal || stat.type !== 'chardev') rights &= ~(RIGHT_FD_SEEK | RIGHT_FD_TELL)
+        }
         const dv = view()
         dv.setUint8(ptr, FILETYPE[stat.type])
         dv.setUint16(ptr + 2, 0, true)
-        dv.setBigUint64(ptr + 8, ALL_RIGHTS, true)
-        dv.setBigUint64(ptr + 16, ALL_RIGHTS, true)
+        dv.setBigUint64(ptr + 8, rights, true)
+        dv.setBigUint64(ptr + 16, rights, true)
       }),
     fd_fdstat_set_flags: () => SUCCESS,
     fd_fdstat_set_rights: () => SUCCESS,
 
     fd_prestat_get: (fd: number, ptr: number) => {
-      const name = preopens.get(fd)
-      if (!name) return WASI_EBADF
-      view().setUint8(ptr, 0)
-      view().setUint32(ptr + 4, name.length, true)
+      const name = fds.prestat(fd)
+      if (name === undefined) return WASI_EBADF
+      // Tag 0 is a directory; another tag makes libc's preopen scan move on to the next fd.
+      view().setUint8(ptr, name ? 0 : 0xff)
+      view().setUint32(ptr + 4, name?.length ?? 0, true)
       return SUCCESS
     },
     fd_prestat_dir_name: (fd: number, ptr: number, len: number) => {
-      const name = preopens.get(fd)
+      const name = fds.prestat(fd)
       if (!name) return WASI_EBADF
       bytes().set(name.subarray(0, len), ptr)
       return SUCCESS
     },
 
-    fd_filestat_get: (fd: number, ptr: number) => guard(() => writeFilestat(ptr, sys.call('fstat', kfd(fd)))),
-    fd_filestat_set_size: (fd: number, size: bigint) => guard(() => sys.call('ftruncate', kfd(fd), Number(size))),
-    fd_filestat_set_times: () => SUCCESS,
+    fd_filestat_get: (fd: number, ptr: number) => guard(() => writeFilestat(ptr, fstat(fd))),
+    fd_filestat_set_size: (fd: number, size: bigint) => guard(() => sys.call('ftruncate', fds.kernel(fd), Number(size))),
+    fd_filestat_set_times: (fd: number, atim: bigint, mtim: bigint, flags: number) =>
+      guard(() => {
+        const [dirfd, path] = fds.at(fd, '.')
+        const [atime, mtime] = times(atim, mtim, flags)
+        if (dirfd === AT_FDCWD) sys.call('utimes', path, atime, mtime)
+        else sys.call('utimes', null, atime, mtime, fds.kernel(fd))
+      }),
     fd_sync: () => SUCCESS,
     fd_datasync: () => SUCCESS,
     fd_advise: () => SUCCESS,
@@ -317,11 +437,11 @@ export function createPreview1(options: Preview1Options): Preview1 {
       guard(() => {
         let entries = directoryListings.get(fd)
         if (!entries || cookie === 0n) {
-          const self = sys.call('fstat', kfd(fd))
+          const self = sys.call('fstat', fds.kernel(fd))
           entries = [
             { name: '.', type: 'dir', ino: self.ino },
             { name: '..', type: 'dir', ino: 0 },
-            ...sys.call('getdents', kfd(fd)),
+            ...sys.call('getdents', fds.kernel(fd)),
           ]
           directoryListings.set(fd, entries)
         }
@@ -354,93 +474,150 @@ export function createPreview1(options: Preview1Options): Preview1 {
       _rightsInheriting: bigint,
       fdflags: number,
       fdPtr: number,
-    ) =>
-      guard(() => {
-        const read = (rightsBase & RIGHT_FD_READ) !== 0n
-        const write = (rightsBase & RIGHT_FD_WRITE) !== 0n
-        let flags = write ? (read ? O_RDWR : O_WRONLY) : O_RDONLY
-        if (oflags & OFLAG_CREAT) flags |= O_CREAT
-        if (oflags & OFLAG_DIRECTORY) flags = (flags & ~O_RDWR & ~O_WRONLY) | O_DIRECTORY
-        if (oflags & OFLAG_EXCL) flags |= O_EXCL
-        if (oflags & OFLAG_TRUNC) flags |= O_TRUNC
-        if (fdflags & FDFLAG_APPEND) flags |= O_APPEND
-        const kernelFd = sys.call('open', readString(pathPtr, pathLen), flags, 0o666, dir(dirfd))
-        view().setUint32(fdPtr, allocate(kernelFd), true)
-      }),
+    ) => guard(() => view().setUint32(fdPtr, openAt(dirfd, readString(pathPtr, pathLen), oflags, rightsBase, fdflags, false), true)),
 
     path_filestat_get: (dirfd: number, flags: number, pathPtr: number, pathLen: number, ptr: number) =>
       guard(() => {
-        const path = readString(pathPtr, pathLen)
-        writeFilestat(ptr, flags & LOOKUP_SYMLINK_FOLLOW ? sys.call('stat', path, dir(dirfd)) : sys.call('lstat', path, dir(dirfd)))
+        const [at, path] = fds.at(dirfd, readString(pathPtr, pathLen))
+        writeFilestat(ptr, flags & LOOKUP_SYMLINK_FOLLOW ? sys.call('stat', path, at) : sys.call('lstat', path, at))
       }),
     path_readlink: (dirfd: number, pathPtr: number, pathLen: number, buf: number, bufLen: number, bufusedPtr: number) =>
       guard(() => {
-        const target = encoder.encode(sys.call('readlink', readString(pathPtr, pathLen), dir(dirfd))).subarray(0, bufLen)
+        const [at, path] = fds.at(dirfd, readString(pathPtr, pathLen))
+        const target = encoder.encode(sys.call('readlink', path, at)).subarray(0, bufLen)
         bytes().set(target, buf)
         view().setUint32(bufusedPtr, target.length, true)
       }),
     path_symlink: (targetPtr: number, targetLen: number, dirfd: number, pathPtr: number, pathLen: number) =>
-      guard(() => sys.call('symlink', readString(targetPtr, targetLen), readString(pathPtr, pathLen), dir(dirfd))),
+      guard(() => {
+        const [at, path] = fds.at(dirfd, readString(pathPtr, pathLen))
+        sys.call('symlink', readString(targetPtr, targetLen), path, at)
+      }),
     path_link: (fromFd: number, _flags: number, fromPtr: number, fromLen: number, toFd: number, toPtr: number, toLen: number) =>
-      guard(() => sys.call('link', readString(fromPtr, fromLen), readString(toPtr, toLen), dir(fromFd), dir(toFd))),
-    path_filestat_set_times: () => SUCCESS,
+      guard(() => {
+        const [fromAt, from] = fds.at(fromFd, readString(fromPtr, fromLen))
+        const [toAt, to] = fds.at(toFd, readString(toPtr, toLen))
+        sys.call('link', from, to, fromAt, toAt)
+      }),
+    path_filestat_set_times: (dirfd: number, lookupFlags: number, pathPtr: number, pathLen: number, atim: bigint, mtim: bigint, flags: number) =>
+      guard(() => {
+        const [at, path] = fds.at(dirfd, readString(pathPtr, pathLen))
+        const [atime, mtime] = times(atim, mtim, flags)
+        sys.call('utimes', path, atime, mtime, at, (lookupFlags & LOOKUP_SYMLINK_FOLLOW) !== 0)
+      }),
     path_create_directory: (dirfd: number, pathPtr: number, pathLen: number) =>
-      guard(() => sys.call('mkdir', readString(pathPtr, pathLen), 0o777, dir(dirfd))),
+      guard(() => {
+        const [at, path] = fds.at(dirfd, readString(pathPtr, pathLen))
+        sys.call('mkdir', path, 0o777, at)
+      }),
     path_unlink_file: (dirfd: number, pathPtr: number, pathLen: number) =>
-      guard(() => sys.call('unlink', readString(pathPtr, pathLen), dir(dirfd))),
+      guard(() => {
+        const [at, path] = fds.at(dirfd, readString(pathPtr, pathLen))
+        sys.call('unlink', path, at)
+      }),
     path_remove_directory: (dirfd: number, pathPtr: number, pathLen: number) =>
-      guard(() => sys.call('rmdir', readString(pathPtr, pathLen), dir(dirfd))),
+      guard(() => {
+        const [at, path] = fds.at(dirfd, readString(pathPtr, pathLen))
+        sys.call('rmdir', path, at)
+      }),
     path_rename: (fromFd: number, fromPtr: number, fromLen: number, toFd: number, toPtr: number, toLen: number) =>
-      guard(() => sys.call('rename', readString(fromPtr, fromLen), readString(toPtr, toLen), dir(fromFd), dir(toFd))),
+      guard(() => {
+        const [fromAt, from] = fds.at(fromFd, readString(fromPtr, fromLen))
+        const [toAt, to] = fds.at(toFd, readString(toPtr, toLen))
+        sys.call('rename', from, to, fromAt, toAt)
+      }),
 
-    poll_oneoff: (inPtr: number, outPtr: number, count: number, neventsPtr: number) => {
-      // Clock subscriptions sleep; fd subscriptions are reported ready immediately (M0 limitation).
-      const dv = view()
-      let timeoutNs = Infinity
-      for (let i = 0; i < count; i++) {
-        const sub = inPtr + i * 48
-        if (dv.getUint8(sub + 8) === EVENTTYPE_CLOCK) {
-          const clock = dv.getUint32(sub + 16, true)
-          let ns = Number(dv.getBigUint64(sub + 24, true))
-          if (dv.getUint16(sub + 40, true) & 1) ns -= Number(nowNs(clock))
-          timeoutNs = Math.min(timeoutNs, Math.max(0, ns))
-        } else {
-          timeoutNs = 0
+    poll_oneoff: (inPtr: number, outPtr: number, count: number, neventsPtr: number) =>
+      guard(() => {
+        const dv = view()
+        let timeout = Infinity
+        let clock = -1
+        const watched: { index: number; fd: number; events: number }[] = []
+        for (let i = 0; i < count; i++) {
+          const sub = inPtr + i * 48
+          const type = dv.getUint8(sub + 8)
+          if (type === EVENTTYPE_CLOCK) {
+            const id = dv.getUint32(sub + 16, true)
+            let ns = Number(dv.getBigUint64(sub + 24, true))
+            if (dv.getUint16(sub + 40, true) & 1) ns -= Number(nowNs(id))
+            if (Math.max(0, ns) / 1e6 < timeout) {
+              timeout = Math.max(0, ns) / 1e6
+              clock = i
+            }
+          } else {
+            watched.push({ index: i, fd: dv.getUint32(sub + 16, true), events: type === EVENTTYPE_FD_READ ? POLLIN : POLLOUT })
+          }
         }
-      }
-      if (timeoutNs > 0 && Number.isFinite(timeoutNs)) {
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, timeoutNs / 1e6)
-      }
-      for (let i = 0; i < count; i++) {
-        const sub = inPtr + i * 48
-        const event = outPtr + i * 32
-        dv.setBigUint64(event, dv.getBigUint64(sub, true), true)
-        dv.setUint16(event + 8, 0, true)
-        dv.setUint8(event + 10, dv.getUint8(sub + 8))
-      }
-      dv.setUint32(neventsPtr, count, true)
-      return SUCCESS
-    },
+        const ready: { index: number; error: number; bytes: number; hangup: boolean }[] = []
+        if (watched.length) {
+          // Each fd must be one the kernel knows; one that isn't reports its error.
+          const kernelFds: [number, number][] = []
+          for (const entry of watched) {
+            try {
+              kernelFds.push([fds.kernel(entry.fd), entry.events])
+            } catch (error) {
+              if (!(error instanceof SysError)) throw error
+              ready.push({ index: entry.index, error: wasiErrno(error.errno), bytes: 0, hangup: false })
+            }
+          }
+          if (!ready.length) {
+            const results = sys.call('poll', kernelFds, Number.isFinite(timeout) ? Math.ceil(timeout) : -1)
+            results.forEach(([revents, readable], i) => {
+              if (revents) ready.push({ index: watched[i].index, error: 0, bytes: readable, hangup: (revents & POLLHUP) !== 0 })
+            })
+          }
+        } else if (Number.isFinite(timeout) && timeout > 0) {
+          // Only a clock: sleep. A signal ends the sleep early.
+          if (!sleep(timeout)) throw new SysError(Errno.EINTR, 'poll_oneoff')
+        }
+        if (!ready.length && clock >= 0) ready.push({ index: clock, error: 0, bytes: 0, hangup: false })
+        ready.forEach(({ index, error, bytes: readable, hangup }, i) => {
+          const sub = inPtr + index * 48
+          const event = outPtr + i * 32
+          dv.setBigUint64(event, dv.getBigUint64(sub, true), true)
+          dv.setUint16(event + 8, error, true)
+          dv.setUint8(event + 10, dv.getUint8(sub + 8))
+          dv.setBigUint64(event + 16, BigInt(readable), true)
+          dv.setUint16(event + 24, hangup ? EVENT_FD_READWRITE_HANGUP : 0, true)
+        })
+        dv.setUint32(neventsPtr, ready.length, true)
+      }),
 
     proc_exit: (code: number) => options.exit(code),
     sched_yield: () => SUCCESS,
   }
 
+  /** fstflags' times as utimes takes them: ms, or null to keep one. */
+  const times = (atim: bigint, mtim: bigint, flags: number): [number | null, number | null] => {
+    const now = Date.now()
+    const time = (value: bigint, set: number, setNow: number) => (flags & setNow ? now : flags & set ? Number(value) / 1e6 : null)
+    return [time(atim, FSTFLAG_ATIM, FSTFLAG_ATIM_NOW), time(mtim, FSTFLAG_MTIM, FSTFLAG_MTIM_NOW)]
+  }
+
+  /** path_open, and WASIX's path_open2 with its close-on-exec flag. */
+  const openAt = (dirfd: number, name: string, oflags: number, rightsBase: bigint, fdflags: number, cloexec: boolean): number => {
+    const [at, path] = fds.at(dirfd, name)
+    return fds.add(sys.call('open', path, openFlags(oflags, rightsBase, fdflags) | (cloexec ? O_CLOEXEC : 0), 0o666, at))
+  }
+
   return {
-    imports: wasi,
-    close() {
-      for (const [fd, kernelFd] of table) {
-        if (fd > 2 || options.ownsStdio) {
-          try {
-            sys.call('close', kernelFd)
-          } catch {
-            // Already closed.
-          }
-        }
-      }
-      table.clear()
+    imports: {
+      ...wasi,
+      // Not part of preview1: WASIX's path_open with fdflagsext (close-on-exec).
+      path_open2: (
+        dirfd: number,
+        _lookupFlags: number,
+        pathPtr: number,
+        pathLen: number,
+        oflags: number,
+        rightsBase: bigint,
+        _rightsInheriting: bigint,
+        fdflags: number,
+        fdflagsext: number,
+        fdPtr: number,
+      ) => guard(() => view().setUint32(fdPtr, openAt(dirfd, readString(pathPtr, pathLen), oflags, rightsBase, fdflags, (fdflagsext & 1) !== 0), true)),
     },
+    guard,
+    close: () => fds.closeAll(),
   }
 }
-
-export { WASI_ENOSYS }

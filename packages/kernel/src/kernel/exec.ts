@@ -21,6 +21,16 @@ export function resolveExecutable(fs: MemFS, argv: string[], cwd: string, PATH: 
   return load(fs, findCommand(fs, argv[0], cwd, PATH), argv, cwd, PATH, 0)
 }
 
+/**
+ * execve's lookup: `file` relative to `cwd`, or, given `search` (a PATH), a command looked up there
+ * when it has no slash. `argv` stays as given, unless an interpreter (`#!`) runs the file.
+ */
+export function resolveFile(fs: MemFS, file: string, argv: string[], cwd: string, PATH: string, search?: string): Executable {
+  if (!file) throw kerr('ENOENT')
+  const path = search !== undefined && !file.includes('/') ? findCommand(fs, file, cwd, search) : resolve(cwd, file)
+  return load(fs, path, argv, cwd, PATH, 0)
+}
+
 export function findCommand(fs: MemFS, command: string, cwd: string, PATH: string): string {
   if (!command) throw kerr('ENOENT')
   if (command.includes('/')) return resolve(cwd, command)

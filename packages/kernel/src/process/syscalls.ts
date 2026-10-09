@@ -1,4 +1,4 @@
-import { errnoMessage, errnoName } from '../abi/errno.ts'
+import { Errno, errnoMessage, errnoName } from '../abi/errno.ts'
 import { awaitSync, beginSync, pageCapacity, park } from '../abi/page.ts'
 import type { SyscallReply, SyscallRequest } from '../abi/protocol.ts'
 import type { SignalMessage } from '../abi/signals.ts'
@@ -30,6 +30,11 @@ export class SyscallClient {
   readonly maxPayload: number
   /** Receives the signals this process handles (see the sigaction syscall). */
   onSignal?: (signal: number) => void
+  /**
+   * Runs a WASI process's signal handlers when a signal whose handler restarts syscalls
+   * (SA_RESTART) interrupted a call; the call is then made again.
+   */
+  onRestart?: () => void
   private readonly port: MessagePort
   private readonly page: SharedArrayBuffer
   private readonly pending = new Map<number, Pending>()
@@ -44,11 +49,17 @@ export class SyscallClient {
   }
 
   call<N extends SyscallName>(name: N, ...args: SyscallArgs<N>): SyscallReturn<N> {
-    beginSync(this.page)
-    this.post({ t: 'sys', id: 0, name, args, sync: true })
-    const { errno, value } = awaitSync(this.page)
-    if (errno) throw new SysError(errno, name)
-    return value as SyscallReturn<N>
+    for (;;) {
+      beginSync(this.page)
+      this.post({ t: 'sys', id: 0, name, args, sync: true })
+      const { errno, value } = awaitSync(this.page)
+      if (errno === Errno.ERESTARTSYS && this.onRestart) {
+        this.onRestart()
+        continue
+      }
+      if (errno) throw new SysError(errno, name)
+      return value as SyscallReturn<N>
+    }
   }
 
   callAsync<N extends SyscallName>(name: N, ...args: SyscallArgs<N>): Promise<SyscallReturn<N>> {

@@ -1,0 +1,15 @@
+{
+  "name": "@webcore/wasix-bin",
+  "version": "0.0.0",
+  "private": true,
+  "description": "C programs built for WASIX with a pinned toolchain (wasixcc): BusyBox, which is webcore's shell and commands, and test programs. libwebcore connects them to the kernel.",
+  "type": "module",
+  "exports": {
+    "./*.wasm": "./dist/*.wasm",
+    "./busybox.links": "./dist/busybox.links",
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs"
+  }
+}

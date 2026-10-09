@@ -1,6 +1,6 @@
 # 0004. Wasm binaries use WASI preview1 + WASIX; Emscripten via an adapter
 
-- **Status:** Accepted · preview1 implemented in M0
+- **Status:** Accepted · preview1 implemented in M0, WASIX in M2c ([0020](0020-wasix-personality.md))
 - **Date:** 2026-10-09
 
 ## Context

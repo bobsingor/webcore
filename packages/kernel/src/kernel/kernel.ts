@@ -3,20 +3,29 @@ import {
   AT_FDCWD,
   DEFAULT_PATH,
   O_ACCMODE,
+  O_CLOEXEC,
   O_CREAT,
   O_DIRECTORY,
   O_EXCL,
   O_RDONLY,
   O_RDWR,
   O_TRUNC,
+  POLLHUP,
+  POLLIN,
+  POLLNVAL,
+  POLLOUT,
 } from '../abi/constants.ts'
-import { completeSync, createPage, DEFAULT_PAGE_BYTES, pageCapacity } from '../abi/page.ts'
+import { clearBell, completeSync, createPage, DEFAULT_PAGE_BYTES, ringBell } from '../abi/page.ts'
 import {
+  defaultStops,
   defaultTerminates,
   FIONREAD,
   isValidSignal,
+  SIGCHLD,
+  SIGCONT,
   SIGHUP,
   SIGKILL,
+  SIGSTOP,
   TCGETS,
   TCSETS,
   TCSETSF,
@@ -27,6 +36,10 @@ import {
   TIOCSCTTY,
   TIOCSPGRP,
   TIOCSWINSZ,
+  waitStatus,
+  WCONTINUED,
+  WNOHANG,
+  WUNTRACED,
   type SignalAction,
   type SignalMessage,
   type Termios,
@@ -39,15 +52,16 @@ import { EventBus } from './events.ts'
 import { extractArchive, type ExtractOptions } from './extract.ts'
 import { Watcher } from './watch.ts'
 import { Listener, Network, Socket } from './net.ts'
-import { resolveExecutable, type Executable } from './exec.ts'
+import { resolveExecutable, resolveFile, type Executable } from './exec.ts'
 import { DeviceHandle, DirHandle, FileHandle, PipeReader, PipeWriter, type OpenFile } from './files.ts'
 import { dirname, normalize, resolve } from './path.ts'
 import { Pipe } from './pipe.ts'
 import { Pty, PtyMaster, PtySlave, ptyOf } from './pty.ts'
 import { diffTrees, materialize, snapshotTree } from './snapshot.ts'
 import { MemoryStore } from './store.ts'
-import { Process, type Channel, type Thread, type WorkerLike } from './process.ts'
-import { MemFS, type FileNode } from './vfs.ts'
+import { MAX_FDS, Process, type Channel, type Thread, type WorkerLike } from './process.ts'
+import { MemFS, type FileNode, type VNode } from './vfs.ts'
+import { memoryImport, type MemoryImport } from './wasm.ts'
 
 /** Environment-specific process startup (ADR-0011). */
 export interface ProcessHost {
@@ -68,13 +82,18 @@ export interface KernelOptions {
 export interface SpawnOptions {
   cwd?: string
   env?: Record<string, string>
-  /** Files for fds 0, 1 and 2. The kernel takes its own references; gaps get /dev/null. */
+  /**
+   * Files for fds 0, 1, 2 and on. The kernel takes its own references; gaps among 0 to 2 get
+   * /dev/null, and others stay closed.
+   */
   stdio?: readonly (OpenFile | undefined)[]
   ppid?: number
   /** Process group to join. By default a process leads a new group of its own. */
   pgid?: number
   /** Session to join. By default a process leads a new session of its own. */
   sid?: number
+  /** The file creation mask. Default: 022. */
+  umask?: number
   /**
    * A terminal (a PTY slave) that becomes the controlling terminal of the process's new session,
    * with the process's group in the foreground: what a terminal emulator does for its shell.
@@ -94,7 +113,9 @@ const STDIO_ALIASES = new Map([
   ['/dev/stdout', 1],
   ['/dev/stderr', 2],
 ])
-const UMASK = 0o022
+/** Syscalls that a signal interrupts with EINTR even under SA_RESTART, as on Linux. */
+const NEVER_RESTARTED = new Set<string>(['poll', 'pause'])
+const DEFAULT_UMASK = 0o022
 const encoder = new TextEncoder()
 
 export class Kernel {
@@ -107,10 +128,12 @@ export class Kernel {
   private readonly host: ProcessHost
   private readonly pageBytes: number
   private readonly procs = new Map<number, Process>()
-  private readonly modules = new WeakMap<FileNode, { version: number; module: Promise<WebAssembly.Module> }>()
+  private readonly modules = new WeakMap<FileNode, { version: number; module: Promise<WebAssembly.Module>; memory?: MemoryImport }>()
   private readonly assets: Record<string, Uint8Array> = {}
   private readonly watchers = new Set<Watcher>()
   private readonly ptys = new Set<Pty>()
+  /** wait4 callers, by parent pid, woken when one of their children changes state. */
+  private readonly childWaiters = new Map<number, (() => void)[]>()
   private nextPid = 1
   private nextPty = 0
 
@@ -157,13 +180,14 @@ export class Kernel {
     const exe = resolveExecutable(this.fs, argv, cwd, env.PATH ?? DEFAULT_PATH)
     const pid = this.nextPid++
     const proc = new Process({ pid, ppid: options.ppid ?? 0, pgid: options.pgid, sid: options.sid, argv: exe.argv, env, cwd })
+    if (options.umask !== undefined) proc.umask = options.umask
     const terminal = options.terminal && ptyOf(options.terminal)
     if (terminal && proc.sid === pid && !this.sessionAlive(terminal.session)) {
       terminal.session = proc.sid
       terminal.foreground = proc.pgid
     }
-    for (let fd = 0; fd < 3; fd++) {
-      proc.fds[fd] = options.stdio?.[fd]?.retain() ?? new DeviceHandle('null', O_RDWR)
+    for (let fd = 0; fd < Math.max(3, options.stdio?.length ?? 0); fd++) {
+      proc.fds[fd] = options.stdio?.[fd]?.retain() ?? (fd < 3 ? new DeviceHandle('null', O_RDWR) : undefined)
     }
     this.procs.set(proc.pid, proc)
     this.events.emit({ type: 'process.spawn', pid: proc.pid, ppid: proc.ppid, argv: proc.argv, cwd })
@@ -342,12 +366,15 @@ export class Kernel {
 
   private async boot(proc: Process, exe: Executable): Promise<void> {
     try {
-      const module = exe.personality === 'wasi' ? await this.compile(exe.node) : undefined
+      const compiled = exe.personality === 'wasi' ? this.compile(exe.node) : undefined
+      const module = await compiled?.module
       if (proc.state === 'exited') return
       const { channel, port } = this.openChannel(proc)
+      proc.channel = channel
       proc.page = channel.page
       proc.port = channel.port
       proc.execPath = exe.path
+      proc.personality = exe.personality
       proc.worker = this.host.createWorker((error) => this.crash(proc, error))
       const boot: BootMessage = {
         pid: proc.pid,
@@ -358,6 +385,8 @@ export class Kernel {
         execPath: exe.path,
         personality: exe.personality,
         module,
+        memory: compiled?.memory,
+        ignored: [...proc.dispositions].filter(([, action]) => action === 'ignore').map(([signal]) => signal),
         assets: this.assets,
         page: channel.page,
         port,
@@ -372,7 +401,7 @@ export class Kernel {
   /** A syscall channel: a page for sync calls and a port for everything else (ADR-0002). */
   private openChannel(proc: Process, thread?: Thread): { channel: Channel; port: MessagePort } {
     const { port1, port2 } = new MessageChannel()
-    const channel: Channel = { page: createPage(this.pageBytes), port: port1, thread }
+    const channel: Channel = { page: createPage(this.pageBytes), port: port1, owner: proc, thread, acting: [] }
     port1.addEventListener('message', (event) => void this.dispatch(proc, event.data, channel))
     port1.start()
     return { channel, port: port2 }
@@ -424,12 +453,13 @@ export class Kernel {
     thread.resolve(code)
   }
 
-  private compile(node: FileNode): Promise<WebAssembly.Module> {
+  private compile(node: FileNode): { module: Promise<WebAssembly.Module>; memory?: MemoryImport } {
     const cached = this.modules.get(node)
-    if (cached?.version === node.version) return cached.module
-    const module = WebAssembly.compile(node.data.slice(0, node.size))
-    this.modules.set(node, { version: node.version, module })
-    return module
+    if (cached?.version === node.version) return cached
+    const bytes = node.data.slice(0, node.size)
+    const compiled = { version: node.version, module: WebAssembly.compile(bytes), memory: memoryImport(bytes) }
+    this.modules.set(node, compiled)
+    return compiled
   }
 
   /** The process died outside its own control (bad module, Worker error). */
@@ -489,16 +519,174 @@ export class Kernel {
     this.terminate(proc, 1)
   }
 
-  /** Signal delivery: the default action, nothing, or a message to the process's handler. */
+  /**
+   * Signal delivery: the default action (terminate, stop, or nothing), nothing, or the process's
+   * handler. A Node process gets a message on its port; a WASI process takes its signals between
+   * syscalls (the doorbell), and one blocked in a syscall is interrupted (EINTR). SIGCONT always
+   * continues a stopped process.
+   */
   private deliver(proc: Process, signal: number): void {
     if (!proc.alive || !isValidSignal(signal)) return
-    const action = signal === SIGKILL ? undefined : proc.dispositions.get(signal)
+    if (signal === SIGKILL) return this.terminate(proc, 128 + SIGKILL, SIGKILL)
+    if (signal === SIGCONT && proc.stopped) {
+      proc.resume()
+      this.notifyParent(proc)
+    }
+    if (signal === SIGSTOP) return this.stop(proc, signal)
+    const action = proc.dispositions.get(signal)
     if (action === 'ignore') return
-    if (action === 'handle' && proc.port) {
-      proc.port.postMessage({ t: 'sig', signal } satisfies SignalMessage)
+    if (action === 'handle') {
+      if (proc.personality !== 'wasi') {
+        proc.port?.postMessage({ t: 'sig', signal } satisfies SignalMessage)
+        return
+      }
+      if (!proc.pending.includes(signal)) proc.pending.push(signal)
+      // A vfork parent waits for its child; it takes the signal once it runs again.
+      if (this.running(proc)) {
+        this.ring(proc)
+        proc.interrupt(proc.restart.has(signal))
+      }
       return
     }
-    if (defaultTerminates(signal)) this.terminate(proc, 128 + signal, signal)
+    if (defaultStops(signal)) this.stop(proc, signal)
+    else if (defaultTerminates(signal)) this.terminate(proc, 128 + signal, signal)
+  }
+
+  /** Job control: the process's syscalls wait until SIGCONT. A WASI process checks in at once. */
+  private stop(proc: Process, signal: number): void {
+    if (proc.stopped) return
+    proc.stop(signal)
+    this.ring(proc)
+    this.notifyParent(proc)
+  }
+
+  /** Whether the process runs its own code: not a vfork parent waiting for its child. */
+  private running(proc: Process): boolean {
+    const channel = proc.channel
+    return !channel || (channel.acting.at(-1) ?? channel.owner) === proc
+  }
+
+  /** Tells a running WASI process to take its signals (or wait, while stopped). */
+  private ring(proc: Process): void {
+    if (proc.personality === 'wasi' && proc.channel && this.running(proc)) ringBell(proc.channel.page)
+  }
+
+  /** A child exited, stopped or continued: its parent's wait4 looks again, and gets SIGCHLD. */
+  private notifyParent(child: Process): void {
+    const parent = this.procs.get(child.ppid)
+    if (!parent?.alive) return
+    for (const wake of this.childWaiters.get(parent.pid)?.splice(0) ?? []) wake()
+    this.deliver(parent, SIGCHLD)
+  }
+
+  /**
+   * Linux's rule for orphaned process groups: when `exited` leaves one of its children's groups
+   * without a parent in another group of the session, and the group has a stopped member, the
+   * group gets SIGHUP and then SIGCONT. A shell that exits doesn't leave its stopped jobs behind.
+   */
+  private hangUpOrphanedGroups(exited: Process): void {
+    const groups = new Set(this.processes.filter((child) => child.ppid === exited.pid && child.alive && child.pgid !== exited.pgid).map((child) => child.pgid))
+    for (const pgid of groups) {
+      const members = this.processes.filter((member) => member.pgid === pgid && member.alive)
+      const anchored = members.some((member) => {
+        const parent = this.procs.get(member.ppid)
+        return parent?.alive && parent.pgid !== pgid && parent.sid === member.sid
+      })
+      if (anchored || !members.some((member) => member.stopped)) continue
+      this.killGroup(pgid, SIGHUP)
+      this.killGroup(pgid, SIGCONT)
+    }
+  }
+
+  /** Waits until a child of `parent` changes state; a signal interrupts it (EINTR). */
+  private childChange(parent: Process): Promise<void> {
+    const signal = parent.signal
+    if (signal.aborted) return Promise.reject(kerr('EINTR'))
+    return new Promise((resolve, reject) => {
+      const waiters = this.childWaiters.get(parent.pid) ?? []
+      this.childWaiters.set(parent.pid, waiters)
+      const onAbort = () => {
+        const index = waiters.indexOf(wake)
+        if (index >= 0) waiters.splice(index, 1)
+        reject(kerr('EINTR'))
+      }
+      const wake = () => {
+        signal.removeEventListener('abort', onAbort)
+        resolve()
+      }
+      signal.addEventListener('abort', onAbort, { once: true })
+      waiters.push(wake)
+    })
+  }
+
+  /**
+   * execve: `proc` runs `exe` from now on. A vfork child gets a Worker of its own, and the thread
+   * that ran it continues as its parent; a process replacing itself gets a new Worker.
+   */
+  private exec(proc: Process, exe: Executable, env: Record<string, string>): void {
+    proc.argv = exe.argv
+    proc.env = env
+    proc.closeOnExec()
+    for (const [signal, action] of [...proc.dispositions]) if (action === 'handle') proc.dispositions.delete(signal)
+    proc.restart.clear()
+    proc.pending.length = 0
+    const channel = proc.channel
+    proc.channel = undefined
+    if (channel && channel.owner !== proc) {
+      channel.acting.pop()
+      this.resumeVforkParent(channel)
+    } else {
+      // The program's threads end with it, as on Linux.
+      for (const thread of [...proc.threads.values()]) this.endThread(proc, thread, 0)
+      proc.port?.close()
+      try {
+        proc.worker?.terminate()
+      } catch {
+        // Already gone.
+      }
+      proc.worker = undefined
+    }
+    this.events.emit({ type: 'process.exec', pid: proc.pid, argv: proc.argv })
+    void this.boot(proc, exe)
+  }
+
+  /** The thread that ran a vfork child runs its parent again, which may have signals waiting. */
+  private resumeVforkParent(channel: Channel): void {
+    const parent = channel.acting.at(-1) ?? channel.owner
+    if (parent.pending.length) this.ring(parent)
+  }
+
+  /** Readiness of `fds` for poll: [revents, bytes readable] for each. */
+  private pollFds(proc: Process, fds: [number, number][]): [number, number][] {
+    return fds.map(([fd, events]) => {
+      const file = Number.isInteger(fd) && fd >= 0 ? proc.fds[fd] : undefined
+      if (!file) return [POLLNVAL, 0]
+      const ready = file.readiness()
+      let revents = ready.hangup ? POLLHUP : 0
+      if (ready.read && events & POLLIN) revents |= POLLIN
+      if (ready.write && events & POLLOUT) revents |= POLLOUT
+      return [revents, ready.bytes]
+    })
+  }
+
+  /** Waits until one of `files` may have become ready, `deadline` passes, or a signal comes. */
+  private readinessChange(files: OpenFile[], deadline: number, signal: AbortSignal): Promise<void> {
+    if (signal.aborted) return Promise.reject(kerr('EINTR'))
+    return new Promise((resolve, reject) => {
+      const stops: (() => void)[] = []
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const done = (error?: unknown) => {
+        for (const stop of stops) stop()
+        clearTimeout(timer)
+        signal.removeEventListener('abort', onAbort)
+        if (error) reject(error)
+        else resolve()
+      }
+      const onAbort = () => done(kerr('EINTR'))
+      for (const file of files) stops.push(file.watchReadiness(() => done()))
+      if (Number.isFinite(deadline)) timer = setTimeout(() => done(), Math.max(0, deadline - Date.now()))
+      signal.addEventListener('abort', onAbort, { once: true })
+    })
   }
 
   /** Whether any live process belongs to session `sid`. */
@@ -510,6 +698,11 @@ export class Kernel {
     if (proc.state === 'exited') return
     proc.termSignal = signal
     proc.markExited(code & 0xff)
+    // vfork children running on this process's Worker die with it.
+    if (proc.channel?.owner === proc) {
+      for (const child of proc.channel.acting.splice(0).reverse()) this.terminate(child, 128 + SIGKILL, SIGKILL)
+    }
+    this.childWaiters.delete(proc.pid)
     proc.closeAll()
     proc.port?.close()
     try {
@@ -519,6 +712,8 @@ export class Kernel {
     }
     for (const thread of [...proc.threads.values()]) this.endThread(proc, thread, code)
     this.events.emit({ type: 'process.exit', pid: proc.pid, code: proc.exitCode! })
+    this.notifyParent(proc)
+    this.hangUpOrphanedGroups(proc)
 
     // A session leader's exit takes its controlling terminal away; the foreground job hangs up.
     for (const pty of [...this.ptys]) {
@@ -551,19 +746,30 @@ export class Kernel {
       else this.terminate(proc, Number(request.args[0]) | 0)
       return
     }
+    // While the channel acts as a vfork child, its syscalls are the child's.
+    const target = channel.acting.at(-1) ?? proc
     let errno = 0
     let value: SyscallValue
+    let call: ReturnType<Process['beginCall']> | undefined
     try {
       if (!Object.hasOwn(this.handlers, request.name)) throw kerr('ENOSYS', request.name)
+      // A stopped process's syscalls wait for SIGCONT (job control).
+      if (target.stopped) await target.whenContinued()
+      // A WASI process blocks in one syscall at a time, which a signal for its handlers interrupts.
+      if (request.sync && target.personality === 'wasi' && !channel.thread) call = target.beginCall()
       const handler = this.handlers[request.name] as AnyHandler
-      value = await handler(proc, ...request.args)
+      value = await handler(target, ...request.args)
     } catch (error) {
       if (error instanceof KernelError) {
         errno = error.errno
+        // Handlers installed with SA_RESTART restart the call, except those Linux never restarts.
+        if (errno === Errno.EINTR && call?.restarts() && !NEVER_RESTARTED.has(request.name)) errno = Errno.ERESTARTSYS
       } else {
         errno = Errno.EIO
         console.error(`[kernel] ${request.name} failed`, error)
       }
+    } finally {
+      call?.end()
     }
     // The process (or thread) may have ended while the syscall was pending.
     if (!proc.alive || (channel.thread && !channel.thread.alive)) return
@@ -577,7 +783,7 @@ export class Kernel {
 
   private readonly handlers: Handlers = {
     open: (proc, path, flags, mode = 0o666, dirfd = AT_FDCWD) =>
-      proc.allocFd(this.openPath(this.resolveAt(proc, dirfd, path), flags | 0, mode, proc)),
+      proc.allocFd(this.openPath(this.resolveAt(proc, dirfd, path), flags | 0, mode, proc), 0, (flags & O_CLOEXEC) !== 0),
 
     close: (proc, fd) => {
       proc.closeFd(fd)
@@ -585,16 +791,17 @@ export class Kernel {
     },
 
     read: (proc, fd, length) => {
-      const max = Math.max(0, Math.min(length | 0, pageCapacity(proc.page!)))
+      // Every syscall page has the same capacity; a vfork child uses its parent's.
+      const max = Math.max(0, Math.min(length | 0, this.pageBytes))
       const file = proc.getFd(fd)
       // Terminal reads depend on who reads: only the foreground group gets input.
-      if (file instanceof PtySlave) return file.pty.read(max, proc.abort.signal, proc)
-      return file.read(max, proc.abort.signal)
+      if (file instanceof PtySlave) return file.pty.read(max, proc.signal, proc)
+      return file.read(max, proc.signal)
     },
 
     write: (proc, fd, data) => {
       if (!(data instanceof Uint8Array)) throw kerr('EINVAL')
-      return proc.getFd(fd).write(data, proc.abort.signal)
+      return proc.getFd(fd).write(data, proc.signal)
     },
 
     seek: (proc, fd, offset, whence) => proc.getFd(fd).seek(offset, whence),
@@ -633,7 +840,7 @@ export class Kernel {
 
     mkdir: (proc, path, mode = 0o777, dirfd = AT_FDCWD) => {
       const target = this.resolveAt(proc, dirfd, path)
-      this.fs.mkdir(target, mode & 0o777 & ~UMASK)
+      this.fs.mkdir(target, mode & 0o777 & ~proc.umask)
       this.events.emit({ type: 'fs.change', op: 'mkdir', path: target })
       return 0
     },
@@ -682,7 +889,7 @@ export class Kernel {
       const env = request.env ?? proc.env
       // Detached children start a session of their own (setsid). Others stay in the caller's
       // session, in its group, a new group (pgid 0), or a given group of the same session.
-      if (request.detached) return this.spawn(argv, { cwd, env, stdio, ppid: proc.pid }).pid
+      if (request.detached) return this.spawn(argv, { cwd, env, stdio, ppid: proc.pid, umask: proc.umask }).pid
       let pgid: number | undefined = proc.pgid
       if (request.pgid !== undefined) {
         pgid = request.pgid === 0 ? undefined : request.pgid
@@ -690,7 +897,7 @@ export class Kernel {
         // rejoined: a pipeline's first stage can end before the last one starts.
         if (pgid !== undefined && this.processes.some((member) => member.pgid === pgid && member.sid !== proc.sid)) throw kerr('EPERM')
       }
-      return this.spawn(argv, { cwd, env, stdio, ppid: proc.pid, pgid, sid: proc.sid }).pid
+      return this.spawn(argv, { cwd, env, stdio, ppid: proc.pid, pgid, sid: proc.sid, umask: proc.umask }).pid
     },
 
     kill: (proc, pid, signal) => {
@@ -702,18 +909,24 @@ export class Kernel {
         if (signal !== 0) this.killGroup(pgid, signal | 0)
         return 0
       }
+      // A child that exited exists until its parent waits for it: signalling it succeeds, as on
+      // Linux, and does nothing.
       const target = this.procs.get(pid)
-      if (!target || !target.alive) throw kerr('ESRCH')
+      if (!target) throw kerr('ESRCH')
       if (signal !== 0) this.deliver(target, signal | 0)
       return 0
     },
 
-    sigaction: (proc, signal, action) => {
+    sigaction: (proc, signal, action, restart = false) => {
       if (!isValidSignal(signal) || signal === SIGKILL || signal === 19 /* SIGSTOP */) throw kerr('EINVAL')
       if (action !== 'default' && action !== 'ignore' && action !== 'handle') throw kerr('EINVAL')
       const previous: SignalAction = proc.dispositions.get(signal) ?? 'default'
       if (action === 'default') proc.dispositions.delete(signal)
       else proc.dispositions.set(signal, action)
+      if (action === 'handle' && restart) proc.restart.add(signal)
+      else proc.restart.delete(signal)
+      // Ignoring a signal discards it if it is pending, as on Linux.
+      if (action === 'ignore' && proc.pending.includes(signal)) proc.pending.splice(proc.pending.indexOf(signal), 1)
       return previous
     },
 
@@ -766,7 +979,7 @@ export class Kernel {
     accept: async (proc, fd) => {
       const listener = proc.getFd(fd)
       if (!(listener instanceof Listener)) throw kerr(listener.type === 'socket' ? 'EINVAL' : 'ENOTSOCK')
-      const socket = await listener.accept(proc.abort.signal)
+      const socket = await listener.accept(proc.signal)
       return this.installSocket(proc, socket)
     },
 
@@ -814,6 +1027,155 @@ export class Kernel {
       return 0
     },
 
+    dup: (proc, fd, min = 0, cloexec = false) => {
+      if (!Number.isInteger(min) || min < 0 || min >= MAX_FDS) throw kerr('EINVAL')
+      return proc.allocFd(proc.getFd(fd).retain(), min, Boolean(cloexec))
+    },
+
+    dup2: (proc, fd, to) => {
+      const file = proc.getFd(fd)
+      if (fd !== to) proc.setFd(to, file.retain())
+      return to
+    },
+
+    fdflags: (proc, fd, cloexec) => {
+      proc.getFd(fd)
+      if (cloexec === true) proc.cloexec.add(fd)
+      else if (cloexec === false) proc.cloexec.delete(fd)
+      return proc.cloexec.has(fd) ? 1 : 0
+    },
+
+    chmod: (proc, path, mode, dirfd = AT_FDCWD) => {
+      const target = this.nodeAt(proc, path, dirfd)
+      if (!target) return 0
+      target.node.mode = (target.node.mode & ~0o7777) | (mode & 0o7777)
+      target.node.ctimeMs = Date.now()
+      // A change of mode or times reports as a write: watchers and workspaces see the file change.
+      this.events.emit({ type: 'fs.change', op: 'write', path: target.path })
+      return 0
+    },
+
+    utimes: (proc, path, atimeMs, mtimeMs, dirfd = AT_FDCWD, follow = true) => {
+      const target = this.nodeAt(proc, path, dirfd, follow)
+      if (!target) return 0
+      if (typeof atimeMs === 'number') target.node.atimeMs = atimeMs
+      if (typeof mtimeMs === 'number') target.node.mtimeMs = mtimeMs
+      target.node.ctimeMs = Date.now()
+      this.events.emit({ type: 'fs.change', op: 'write', path: target.path })
+      return 0
+    },
+
+    poll: async (proc, fds, timeout) => {
+      if (!Array.isArray(fds)) throw kerr('EINVAL')
+      const signal = proc.signal
+      const deadline = timeout >= 0 ? Date.now() + timeout : Infinity
+      for (;;) {
+        const ready = this.pollFds(proc, fds)
+        if (ready.some(([revents]) => revents) || Date.now() >= deadline) return ready
+        const files = fds.flatMap(([fd]) => proc.fds[fd] ?? [])
+        await this.readinessChange(files, deadline, signal)
+      }
+    },
+
+    vfork: (proc) => {
+      const channel = proc.channel
+      if (!channel || channel.thread) throw kerr('ENOSYS')
+      const child = new Process({ pid: this.nextPid++, ppid: proc.pid, pgid: proc.pgid, sid: proc.sid, argv: [...proc.argv], env: { ...proc.env }, cwd: proc.cwd })
+      child.personality = proc.personality
+      child.execPath = proc.execPath
+      child.state = 'running'
+      child.channel = channel
+      proc.fds.forEach((file, fd) => {
+        if (file) child.fds[fd] = file.retain()
+      })
+      for (const fd of proc.cloexec) child.cloexec.add(fd)
+      for (const [signal, action] of proc.dispositions) child.dispositions.set(signal, action)
+      for (const signal of proc.restart) child.restart.add(signal)
+      child.umask = proc.umask
+      this.procs.set(child.pid, child)
+      channel.acting.push(child)
+      this.events.emit({ type: 'process.spawn', pid: child.pid, ppid: proc.pid, argv: child.argv, cwd: child.cwd })
+      return child.pid
+    },
+
+    vforkExit: (proc, code) => {
+      const channel = proc.channel
+      if (!channel || channel.acting.at(-1) !== proc) throw kerr('EINVAL')
+      channel.acting.pop()
+      proc.channel = undefined
+      this.terminate(proc, Number(code) | 0)
+      this.resumeVforkParent(channel)
+      return 0
+    },
+
+    execve: (proc, file, argv, env, search) => {
+      if (typeof file !== 'string' || !Array.isArray(argv) || !argv.every((arg) => typeof arg === 'string')) throw kerr('EINVAL')
+      if (typeof env !== 'object' || env === null) throw kerr('EINVAL')
+      if (!proc.alive) throw kerr('ESRCH')
+      const variables = Object.fromEntries(Object.entries(env).map(([key, value]) => [key, String(value)]))
+      const exe = resolveFile(this.fs, file, argv, proc.cwd, variables.PATH ?? DEFAULT_PATH, search)
+      this.exec(proc, exe, variables)
+      return 0
+    },
+
+    wait4: async (proc, pid, options) => {
+      for (;;) {
+        const children = this.processes.filter(
+          (child) =>
+            child.ppid === proc.pid &&
+            (pid > 0 ? child.pid === pid : pid === -1 ? true : pid === 0 ? child.pgid === proc.pgid : child.pgid === -pid),
+        )
+        if (!children.length) throw kerr('ECHILD')
+        for (const child of children) {
+          if (child.state === 'exited') {
+            this.procs.delete(child.pid)
+            const status = child.termSignal === null ? waitStatus({ code: child.exitCode ?? 0 }) : waitStatus({ signal: child.termSignal })
+            return [child.pid, status]
+          }
+          if (child.change === 'stopped' && options & WUNTRACED) {
+            child.change = undefined
+            return [child.pid, waitStatus({ stopped: child.stopSignal })]
+          }
+          if (child.change === 'continued' && options & WCONTINUED) {
+            child.change = undefined
+            return [child.pid, waitStatus({ continued: true })]
+          }
+        }
+        if (options & WNOHANG) return [0, 0]
+        await this.childChange(proc)
+      }
+    },
+
+    umask: (proc, mask) => {
+      const previous = proc.umask
+      if (typeof mask === 'number') proc.umask = mask & 0o777
+      return previous
+    },
+
+    getpgid: (proc, pid) => {
+      const target = pid === 0 ? proc : this.procs.get(pid)
+      if (!target) throw kerr('ESRCH')
+      return target.pgid
+    },
+
+    pause: (proc) =>
+      new Promise<number>((_, reject) => {
+        const signal = proc.signal
+        if (signal.aborted) return reject(kerr('EINTR'))
+        signal.addEventListener('abort', () => reject(kerr('EINTR')), { once: true })
+      }),
+
+    takeSignals: (proc) => {
+      if (proc.channel) clearBell(proc.channel.page)
+      const taken: number[] = []
+      for (const signal of proc.pending.splice(0)) {
+        // A signal whose handler was removed meanwhile takes its action now.
+        if (proc.dispositions.get(signal) === 'handle') taken.push(signal)
+        else this.deliver(proc, signal)
+      }
+      return taken
+    },
+
     wait: async (proc, pid) => {
       const child = this.procs.get(pid)
       if (!child || child.ppid !== proc.pid) throw kerr('ECHILD')
@@ -825,7 +1187,7 @@ export class Kernel {
 
   /** spawnSync, run entirely inside the kernel so the blocked caller can't deadlock on pipes. */
   private async spawnSync(proc: Process, argv: string[], request: SpawnSyncRequest): Promise<Uint8Array> {
-    const capacity = pageCapacity(proc.page!) - SPAWN_SYNC_HEADER_BYTES
+    const capacity = this.pageBytes - SPAWN_SYNC_HEADER_BYTES
     const maxBuffer = Math.min(request.maxBuffer ?? capacity, capacity)
     const held: OpenFile[] = []
     const captured: (Promise<Uint8Array> | undefined)[] = [undefined, undefined, undefined]
@@ -911,6 +1273,16 @@ export class Kernel {
     return { fd: proc.allocFd(socket), local: socket.local, peer: socket.peer }
   }
 
+  /** The node `path` names relative to `dirfd`, or the file `dirfd` itself (undefined: not a file). */
+  private nodeAt(proc: Process, path: string | null, dirfd: number, follow = true): { node: VNode; path: string } | undefined {
+    if (path === null) {
+      const file = proc.getFd(dirfd)
+      return file instanceof FileHandle || file instanceof DirHandle ? { node: file.node, path: file.path } : undefined
+    }
+    const resolved = this.resolveAt(proc, dirfd, path)
+    return { node: this.fs.lookup(resolved, follow), path: resolved }
+  }
+
   private resolveAt(proc: Process, dirfd: number, path: string): string {
     if (typeof path !== 'string') throw kerr('EINVAL')
     if (!path) throw kerr('ENOENT')
@@ -931,7 +1303,7 @@ export class Kernel {
       // Creating through a dangling symbolic link creates its target, as on Linux.
       const link = this.fs.tryLookup(path, false)
       const target = link?.kind === 'symlink' ? resolve(dirname(path), link.target) : path
-      node = this.fs.createFile(target, mode & 0o777 & ~UMASK)
+      node = this.fs.createFile(target, mode & 0o777 & ~(proc?.umask ?? DEFAULT_UMASK))
       this.events.emit({ type: 'fs.change', op: 'create', path: target })
     } else if (flags & O_CREAT && flags & O_EXCL) {
       throw kerr('EEXIST', path)

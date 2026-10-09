@@ -1,5 +1,5 @@
-// /bin/sh (packages/userland/src/sh): the language, pipelines on kernel pipes, Node's
-// child_process shell, and process groups.
+// /bin/sh, BusyBox's hush (M2c): the language, pipelines on kernel pipes, Node's child_process
+// shell, and process groups.
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { exec, DEFAULT_ENV, type Kernel } from '../src/index.ts'
 import { boot, sh } from './helpers.ts'
@@ -38,7 +38,7 @@ describe('sh', () => {
     expect(result.stderr).toBe('')
     expect(result.stdout).toBe(
       [
-        '      1       2       8',
+        '        1         2         8',
         'first',
         'second',
         'or 1',
@@ -67,6 +67,24 @@ describe('sh', () => {
     ])
     expect(result.stdout).toBe('js: src/a.js\njs: src/b.js\ncss\nxx\nxxx\nsrc/*.none\nf\n/home/user/copy\n')
     expect(result.code).toBe(4)
+  })
+
+  it('has functions, case, arithmetic, here-documents and command substitution', async () => {
+    const result = await script([
+      'greet() { echo "hi $1"; return 3; }',
+      'greet there; echo "returned $?"',
+      'case "$1" in a*) echo "starts with a";; *) echo other;; esac',
+      'echo $(( (2 + 3) * 7 )) $((0x10)) $((7 % 4))',
+      'cat <<EOF',
+      'here $1',
+      'EOF',
+      'files=$(ls /etc | wc -l); [ "$files" -gt 3 ] && echo "etc has files"',
+      'printf "%s-%03d\\n" pad 7',
+      'echo "upper" | tr a-z A-Z | sed s/UP/DOWN/',
+      "echo 'x y z' | awk '{ print $2 }'",
+    ], ['abc'])
+    expect(result.stderr).toBe('')
+    expect(result.stdout).toBe('hi there\nreturned 3\nstarts with a\n35 16 3\nhere abc\netc has files\npad-007\nDOWNPER\ny\n')
   })
 
   it('serves Node’s child_process shell', async () => {

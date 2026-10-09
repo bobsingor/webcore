@@ -2,16 +2,18 @@
 // Requires Node ≥ 22.18 or --experimental-strip-types.
 import { readdirSync, readFileSync } from 'node:fs'
 import { nodeProcessHost } from '../src/host/node.ts'
-import { createShell, DEFAULT_ENV, installRootfs, Kernel, runLine } from '../src/index.ts'
+import { busyboxLinks, createShell, DEFAULT_ENV, installRootfs, Kernel, runLine } from '../src/index.ts'
 
 const root = new URL('../../', import.meta.url)
-const binDir = new URL('wat-bin/dist/', root)
-const binaries = Object.fromEntries(
-  readdirSync(binDir).filter((f) => f.endsWith('.wasm')).map((f) => [f.slice(0, -5), new Uint8Array(readFileSync(new URL(f, binDir)))]),
-)
 const kernel = new Kernel({ host: nodeProcessHost() })
 kernel.addAsset('node-lib', new Uint8Array(readFileSync(new URL('node-lib/dist/node-lib.bin', root))))
-installRootfs(kernel, binaries, JSON.parse(readFileSync(new URL('userland/dist/userland.json', root), 'utf8')))
+installRootfs(kernel, {
+  busybox: {
+    binary: new Uint8Array(readFileSync(new URL('wasix-bin/dist/busybox.wasm', root))),
+    links: busyboxLinks(readFileSync(new URL('wasix-bin/dist/busybox.links', root), 'utf8')),
+  },
+  userland: JSON.parse(readFileSync(new URL('userland/dist/userland.json', root), 'utf8')),
+})
 // WEBCORE_FIXTURE=<host dir> copies that directory into /home/user first.
 if (process.env.WEBCORE_FIXTURE) {
   const copy = (from: string, to: string) => {

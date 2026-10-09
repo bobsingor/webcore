@@ -17,7 +17,7 @@
     "@webcore/node-lib": "workspace:*",
     "@webcore/sdk": "workspace:*",
     "@webcore/userland": "workspace:*",
-    "@webcore/wat-bin": "workspace:*"
+    "@webcore/wasix-bin": "workspace:*"
   },
   "devDependencies": {
     "vite": "^8.3.4"

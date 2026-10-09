@@ -1,7 +1,7 @@
 // End-to-end: real Workers, real Wasm, real syscalls, running headless in Node (ADR-0011).
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { exec, type Kernel, type KernelEvent } from '../src/index.ts'
-import { boot, sh } from './helpers.ts'
+import { boot, sh, wasiFixtures } from './helpers.ts'
 
 let kernel: Kernel
 
@@ -16,8 +16,15 @@ afterEach(() => {
 const UPPERCASE = `node -e "process.stdin.on('data', (d) => process.stdout.write(d.toString().toUpperCase()))"`
 
 describe('personalities', () => {
-  it('runs a WASI binary', async () => {
-    expect(await sh(kernel, 'echo hello world')).toMatchObject({ code: 0, stdout: 'hello world\n' })
+  it('runs a WASIX binary: BusyBox', async () => {
+    expect(await exec(kernel, ['echo', 'hello', 'world'])).toMatchObject({ code: 0, stdout: 'hello world\n' })
+    expect(await sh(kernel, 'ls /bin/sh && readlink /bin/sh')).toMatchObject({ code: 0, stdout: '/bin/sh\n/bin/busybox\n' })
+  })
+
+  it('runs a plain WASI preview1 binary', async () => {
+    const { 'wasi-echo': echo } = await wasiFixtures()
+    kernel.fs.writeFile('/usr/bin/wasi-echo', echo, 0o755)
+    expect(await sh(kernel, 'wasi-echo plain preview1 | wc -w')).toMatchObject({ code: 0, stdout: '2\n' })
   })
 
   it('runs JavaScript with node -e and node -p', async () => {
@@ -27,7 +34,7 @@ describe('personalities', () => {
 
   it('pipes WASI → JavaScript → WASI through kernel pipes', async () => {
     expect((await sh(kernel, `echo hello webcore | ${UPPERCASE}`)).stdout).toBe('HELLO WEBCORE\n')
-    expect((await sh(kernel, `echo hello webcore | ${UPPERCASE} | wc`)).stdout).toBe('      1       2      14\n')
+    expect((await sh(kernel, `echo hello webcore | ${UPPERCASE} | wc`)).stdout).toBe('        1         2        14\n')
   })
 
   it('shares one filesystem across personalities', async () => {
@@ -40,7 +47,9 @@ describe('personalities', () => {
   })
 
   it('lists directories through fd_readdir', async () => {
-    expect((await sh(kernel, 'ls /usr/bin')).stdout).toBe('cat\necho\nls\nnode\nnpm\nnpx\nwc\n')
+    const listing = (await sh(kernel, 'ls /usr/bin')).stdout.trim().split('\n')
+    expect(listing).toEqual(expect.arrayContaining(['awk', 'less', 'node', 'npm', 'npx', 'wc']))
+    expect(listing).toEqual([...listing].sort())
   })
 
   it('reads stdin synchronously and asynchronously from JavaScript', async () => {
@@ -73,8 +82,8 @@ describe('processes', () => {
     expect(thrown.code).toBe(1)
     expect(thrown.stderr).toContain('Error: boom')
 
-    expect(await sh(kernel, 'cat /nope')).toMatchObject({ code: 1, stderr: 'cat: /nope: No such file or directory\n' })
-    expect(await sh(kernel, 'nosuchcmd')).toMatchObject({ code: 127, stderr: 'sh: nosuchcmd: command not found\n' })
+    expect(await sh(kernel, 'cat /nope')).toMatchObject({ code: 1, stderr: "cat: can't open '/nope': No such file or directory\n" })
+    expect(await sh(kernel, 'nosuchcmd')).toMatchObject({ code: 127, stderr: "sh: can't execute 'nosuchcmd': No such file or directory\n" })
   })
 
   it('keeps a JavaScript process alive while timers are pending', async () => {
@@ -101,9 +110,13 @@ describe('processes', () => {
   it('emits spawn and exit events', async () => {
     const events: KernelEvent[] = []
     kernel.events.subscribe((event) => events.push(event))
-    await sh(kernel, 'echo hi')
+    await exec(kernel, ['echo', 'hi'])
     expect(events.map((event) => event.type)).toEqual(['process.spawn', 'process.exit'])
     expect(events[1]).toMatchObject({ code: 0 })
+    // A shell starts commands with vfork, then exec.
+    events.length = 0
+    await exec(kernel, ['sh', '-c', 'true; wc /etc/hostname > /dev/null'])
+    expect(events.map((event) => event.type)).toEqual(['process.spawn', 'process.spawn', 'process.exec', 'process.exit', 'process.exit'])
   })
 })
 

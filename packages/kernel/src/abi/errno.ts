@@ -49,6 +49,11 @@ export const Errno = {
   ENOTCONN: 107,
   ETIMEDOUT: 110,
   ECONNREFUSED: 111,
+  /**
+   * Kernel-internal, as on Linux: a signal whose handler was installed with SA_RESTART interrupted
+   * the syscall. A WASI process runs the handler and makes the call again.
+   */
+  ERESTARTSYS: 512,
 } as const
 
 export type ErrnoName = keyof typeof Errno

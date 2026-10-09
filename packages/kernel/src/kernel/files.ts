@@ -19,6 +19,18 @@ import type { Pipe } from './pipe.ts'
 
 const EMPTY = new Uint8Array(0)
 
+/** What poll reports for an open file. */
+export interface Readiness {
+  /** A read would return without waiting (data, end of file, or an error). */
+  read: boolean
+  /** A write would proceed without waiting. */
+  write: boolean
+  /** The other end is gone. */
+  hangup: boolean
+  /** Bytes a read can take now. */
+  bytes: number
+}
+
 export abstract class OpenFile {
   abstract readonly type: FileType
   readonly flags: number
@@ -58,6 +70,16 @@ export abstract class OpenFile {
 
   abstract stat(): Stat
 
+  /** For poll. Files and devices never make a reader or writer wait. */
+  readiness(): Readiness {
+    return { read: this.readable, write: this.writable, hangup: false, bytes: 0 }
+  }
+
+  /** Calls `listener` whenever readiness may have changed; returns what stops it. */
+  watchReadiness(_listener: () => void): () => void {
+    return () => {}
+  }
+
   retain(): this {
     this.refs++
     return this
@@ -73,8 +95,8 @@ export abstract class OpenFile {
 export class FileHandle extends OpenFile {
   readonly type = 'file'
   readonly path: string
+  readonly node: FileNode
   private readonly fs: MemFS
-  private readonly node: FileNode
   private readonly onDirtyClose?: (path: string) => void
   private position = 0
   private dirty = false
@@ -135,8 +157,8 @@ export class FileHandle extends OpenFile {
 export class DirHandle extends OpenFile {
   readonly type = 'dir'
   readonly path: string
+  readonly node: DirNode
   private readonly fs: MemFS
-  private readonly node: DirNode
 
   constructor(fs: MemFS, node: DirNode, path: string, flags: number) {
     super(flags)
@@ -197,6 +219,14 @@ export class PipeReader extends OpenFile {
     return pseudoStat('fifo', S_IFIFO | 0o600, this.pipe.size)
   }
 
+  override readiness(): Readiness {
+    return { read: this.pipe.size > 0 || this.pipe.writeClosed, write: false, hangup: this.pipe.writeClosed, bytes: this.pipe.size }
+  }
+
+  override watchReadiness(listener: () => void): () => void {
+    return this.pipe.watch(listener)
+  }
+
   protected override closed(): void {
     this.pipe.closeRead()
   }
@@ -217,6 +247,15 @@ export class PipeWriter extends OpenFile {
 
   stat(): Stat {
     return pseudoStat('fifo', S_IFIFO | 0o600, this.pipe.size)
+  }
+
+  override readiness(): Readiness {
+    const hangup = this.pipe.readClosed
+    return { read: false, write: hangup || this.pipe.size < this.pipe.capacity, hangup, bytes: 0 }
+  }
+
+  override watchReadiness(listener: () => void): () => void {
+    return this.pipe.watch(listener)
   }
 
   protected override closed(): void {

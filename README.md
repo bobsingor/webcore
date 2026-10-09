@@ -15,7 +15,7 @@ browser's own JIT. Everything else runs as WebAssembly.
 Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design and roadmap, and
 [docs/adr/](docs/adr/README.md) for the decisions behind it.
 
-## Status: M2b, state ✅
+## Status: M2c, real shell ✅ (M2 done)
 
 `node` is **Node.js v24.21.0**: Node's own JavaScript standard library, unmodified, running on the
 browser's JavaScript engine over bindings written against the kernel. The bindings replace the C++
@@ -26,17 +26,21 @@ M1's exit criterion runs in the browser: `npm run dev` starts Vite 8 (with Rolld
 its worker threads), the React app renders in the preview pane, and edits update it in place (HMR).
 The kernel runs in an iframe on its own, cross-origin-isolated origin. Pages embed it with
 `@webcore/sdk` and need no special headers in Chromium (ADR-0009, ADR-0017). The playground's
-terminal is xterm.js on a kernel pseudo-terminal, running an interactive shell with job control:
-Ctrl+C reaches the foreground job, and `node` starts Node's REPL (ADR-0018). `/home` is saved as it
-changes and comes back after a reload, `node_modules` included. Snapshots, restores and forks take
-milliseconds (ADR-0007, ADR-0019).
+terminal is xterm.js on a kernel pseudo-terminal, running BusyBox's hush, compiled from C to
+WebAssembly (WASIX), with line editing and job control: Ctrl+C reaches the foreground job, Ctrl+Z
+stops it, `fg` and `bg` continue it, and `node` starts Node's REPL (ADR-0018, ADR-0020). `ls`,
+`grep`, `sed`, `awk`, `vi`, `less` and a hundred more commands are BusyBox too. `/home` is saved as
+it changes and comes back after a reload, `node_modules` included. Snapshots, restores and forks
+take milliseconds (ADR-0007, ADR-0019).
 
 ```sh
 user@webcore:~$ node -p "process.version + ' on ' + process.platform"
 v24.21.0 on linux
 [exit 0 · 61 ms]
 user@webcore:~$ node -e "const c = require('child_process').spawn('wc'); c.stdout.pipe(process.stdout); c.stdin.end('one two three\n')"
-      1       3      14
+        1         3        14
+user@webcore:~$ seq 5 | awk '{ s += $1 } END { print s }' | sed 's/^/sum: /'
+sum: 15
 ```
 
 What works:
@@ -45,15 +49,16 @@ What works:
   - processes, fd tables, pipes with blocking reads, backpressure, EOF and EPIPE
   - a content-addressed, copy-on-write VFS: snapshots are tree hashes, restores share the stored
     data until a file is written, and identical files are stored once (ADR-0007)
-  - `spawn`/`wait`/`kill`
-  - signals with per-process dispositions: default actions, ignored, or delivered to handlers
-    (ADR-0018)
+  - `spawn`/`wait`/`kill`, and `vfork`/`execve`/`wait4` with close-on-exec fds (ADR-0020)
+  - signals with per-process dispositions: default actions, ignored, or delivered to handlers,
+    with `EINTR` and `SA_RESTART` for blocked calls (ADR-0018, ADR-0020)
+  - job control: stop and continue (`^Z`, `fg`, `bg`), reported by `wait4`
   - pseudo-terminals with Linux's line discipline (editing, echo, `^C`, raw mode, window size),
     sessions, and foreground process groups (ADR-0018)
   - a kernel-side `spawnSync`
   - virtual TCP on one loopback host: `listen`/`accept`/`connect`/`shutdown` (ADR-0014)
-  - symbolic and hard links, process groups (Ctrl+C stops a whole job), and `extract`, which
-    unpacks an npm tarball in one syscall (ADR-0015)
+  - symbolic and hard links, file modes, times and umask, process groups (Ctrl+C stops a whole
+    job), `poll`, and `extract`, which unpacks an npm tarball in one syscall (ADR-0015)
   - threads: Workers inside a process, sharing its fds (ADR-0016)
   - `watch`, an inotify-like fd fed by the kernel's filesystem events
 - **Syscall ABI:** Linux semantics and errno values. Sync calls block on a shared-memory page. Async
@@ -78,16 +83,18 @@ What works:
   - `vm` contexts, approximated in one realm (a Worker can't create another)
   - 69 of 72 builtin modules load; the rest are the inspector and trace modules (see
     [the M1 plan](docs/milestones/M1.md))
-- **npm and sh** (ADR-0015): webcore's own programs, running as processes on its Node.
-  - **npm:** `install`, `ci`, `uninstall`, `run`, `exec`/`npx`, `init`/`create`, with npm's
-    `node_modules` layout, lockfile and `.bin` links. Native packages are swapped for their
-    wasm32-wasi builds.
-  - **sh:** a POSIX-subset shell, which Node's `child_process` uses as its shell. On a terminal
-    it's interactive: history, line editing and completion through Node's `readline`, and each
-    pipeline runs as a job in the foreground.
+- **BusyBox 1.38** (ADR-0020), built from source with a pinned WASIX toolchain: hush is `/bin/sh`
+  (also for Node's `child_process` and npm scripts), with history, line editing, completion and job
+  control. Its applets include coreutils, `grep`, `sed`, `awk`, `find`, `xargs`, `diff`, `tar`,
+  `gzip`, `vi`, `less` and `timeout`.
+- **npm** (ADR-0015): webcore's own program, running as a process on its Node. `install`, `ci`,
+  `uninstall`, `run`, `exec`/`npx`, `init`/`create`, with npm's `node_modules` layout, lockfile and
+  `.bin` links. Native packages are swapped for their wasm32-wasi builds.
 - **Preview:** a server listening on a port is served in an iframe on `p<port>.localhost`, through a
   Service Worker and a bridge to the kernel. Page requests, cookies and WebSockets work (ADR-0014).
-- **WASI preview1:** args, env, preopens, files, directories, pipes, clocks, random, sleeps.
+- **WASI preview1 and WASIX** (ADR-0004, ADR-0020): files, directories, pipes, clocks, polls,
+  processes (vfork, exec, posix_spawn, waitpid), signals, terminals and futexes. libwebcore, which
+  webcore's C programs link, gives them the kernel's process groups, termios and file modes.
 - **Workspaces** (ADR-0019): `/home` saved to the runtime origin's storage (OPFS) a moment after it
   changes, restored on the next load, and forkable. One tab writes a workspace; others read it.
 - **Structured events:** spawn, exit, fs changes, snapshots and saves, and ports opening and closing
@@ -100,7 +107,8 @@ What works:
 
 ## Quick start
 
-Requires Node ≥ 22.13 and pnpm.
+Requires Node ≥ 22.13 and pnpm, plus `make`, `patch` and a C compiler (`cc`) for BusyBox's build
+(macOS or Linux).
 
 ```bash
 pnpm install
@@ -110,8 +118,9 @@ pnpm install
 pnpm dev
 ```
 
-`pnpm dev` builds the WASI test binaries, the Node standard library bundle and the userland
-programs first.
+`pnpm dev` builds BusyBox and the WASIX test programs, the Node standard library bundle and the
+userland programs first. The first build downloads the WASIX toolchain (about 750 MB) into
+`node_modules/.cache`; later builds skip what hasn't changed.
 
 `pnpm dev` starts two servers: the runtime on http://webcore.localhost:5190 and the playground on
 http://localhost:5180. Open the playground: a terminal, example commands, a preview pane, and a
@@ -147,15 +156,16 @@ packages/
     src/abi/             syscall surface, errno, flags, wire protocol, syscall page
     src/kernel/          Kernel, processes, VFS and snapshots, pipes, PTYs, open files, exec, events
     src/process/         Worker entries (browser, Node) and the process-side syscall client
-    src/personalities/   wasi/ (WASI preview1), node/ (Node.js: realm, event loop, bindings)
-    src/host/            ProcessHosts, exec/pipeline helpers, mini shell, root filesystem, HTTP client,
-                         workspaces
+    src/personalities/   wasi/ (WASI preview1, WASIX), node/ (Node.js: realm, event loop, bindings)
+    src/host/            ProcessHosts, exec/pipeline helpers, shell sessions, root filesystem, HTTP
+                         client, workspaces
     src/lib/             environment-free libraries (the HTTP/1.1 parser)
     src/preview/         preview bridge, Service Worker, client script, Vite plugin (ADR-0014)
     test/                unit + end-to-end tests
   node-lib/              Node v24.21.0's lib/, vendored, plus the bundle builder (ADR-0012)
-  userland/              webcore's own programs in TypeScript: sh, npm, npx (ADR-0015)
-  wat-bin/               hand-written WASI programs (echo, cat, wc, ls), no C toolchain needed
+  userland/              webcore's own programs in TypeScript: npm, npx (ADR-0015)
+  wasix-bin/             the pinned WASIX toolchain, BusyBox's build, libwebcore and C test
+                         programs (ADR-0020)
   sdk/                   @webcore/sdk: connect() and the protocol to the runtime frame (ADR-0017)
   runtime/               @webcore/runtime: the runtime page, a static site with isolation headers
 apps/
@@ -211,8 +221,9 @@ import { Kernel, installRootfs, exec, DEFAULT_ENV } from '@webcore/kernel'
 import { nodeProcessHost } from '@webcore/kernel/node'
 
 const kernel = new Kernel({ host: nodeProcessHost(), assets: { 'node-lib': nodeLibBytes } })
-// userland: @webcore/userland's dist/userland.json (sh, npm, npx)
-installRootfs(kernel, { echo: echoWasmBytes /* … */ }, userland)
+// busybox: @webcore/wasix-bin's busybox.wasm and busybox.links (busyboxLinks parses the latter);
+// userland: @webcore/userland's dist/userland.json (npm, npx)
+installRootfs(kernel, { busybox: { binary: busyboxBytes, links }, userland })
 const { code, stdout } = await exec(kernel, ['node', '-p', '6 * 7'], { env: { ...DEFAULT_ENV } })
 ```
 
@@ -238,8 +249,8 @@ const { code, stdout } = await exec(kernel, ['node', '-p', '6 * 7'], { env: { ..
 - **Workspaces stay in the browser.** They're per embedding site, aren't synced across devices, and
   can be evicted under storage pressure. Snapshots don't keep hard links or times. Lazy mounts for
   large runtime images come with Python in M3.
-- **Signals can't interrupt running code.** A handler runs once the program yields; default actions
-  still end the process at once. There's no stop/continue yet, so no `^Z`, `bg` or `fg` (M2c).
-- **The shell is webcore's own `sh`**, a POSIX subset with a few file utilities built in. bash,
-  BusyBox and coreutils arrive with WASIX in M2c.
-- **WASI binaries are hand-written WAT.** Real wasi-sdk/WASIX builds arrive in M2.
+- **Signals can't interrupt running code.** A handler runs once the program yields or makes a
+  syscall; default actions, stops and `SIGKILL` take effect at once.
+- **No `fork()` for Wasm programs.** BusyBox needs only vfork. bash and other programs that fork
+  would need Asyncify (ADR-0020). WASIX threads and sockets aren't mapped to the kernel yet.
+- **One user.** Every file belongs to uid 1000; there are modes but no permission checks.

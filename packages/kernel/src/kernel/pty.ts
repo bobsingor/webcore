@@ -49,7 +49,7 @@ import {
   type Termios,
   type WinSize,
 } from '../abi/signals.ts'
-import { OpenFile, pseudoStat } from './files.ts'
+import { OpenFile, pseudoStat, type Readiness } from './files.ts'
 
 const EMPTY = new Uint8Array(0)
 /** Linux's N_TTY_BUF_SIZE: input beyond it is dropped. */
@@ -89,6 +89,7 @@ export class Pty {
   private masterReaders: Waiter[] = []
   private masterOpen = true
   private slaveOpen = true
+  private readonly watchers = new Set<() => void>()
 
   constructor(index: number, winsize: WinSize, hooks: PtyHooks) {
     this.index = index
@@ -441,6 +442,26 @@ export class Pty {
 
   private wake(queue: Waiter[]): void {
     for (const waiter of queue.splice(0)) waiter()
+    for (const watcher of [...this.watchers]) watcher()
+  }
+
+  // --- poll ---------------------------------------------------------------------------------------
+
+  /** Calls `listener` on every change of input, output or either end, for poll. */
+  watch(listener: () => void): () => void {
+    this.watchers.add(listener)
+    return () => this.watchers.delete(listener)
+  }
+
+  slaveReadiness(): Readiness {
+    const hangup = !this.masterOpen
+    const read = hangup || this.input.length > 0
+    return { read, write: hangup || this.outputBytes < OUTPUT_CAPACITY, hangup, bytes: this.inputBytes }
+  }
+
+  masterReadiness(): Readiness {
+    const hangup = !this.slaveOpen
+    return { read: hangup || this.outputBytes > 0, write: this.slaveOpen, hangup, bytes: this.outputBytes }
   }
 }
 
@@ -470,6 +491,14 @@ export class PtyMaster extends OpenFile {
     return pseudoStat('chardev', S_IFCHR | 0o620, 0)
   }
 
+  override readiness(): Readiness {
+    return this.pty.masterReadiness()
+  }
+
+  override watchReadiness(listener: () => void): () => void {
+    return this.pty.watch(listener)
+  }
+
   protected override closed(): void {
     this.pty.closeMaster()
   }
@@ -495,6 +524,14 @@ export class PtySlave extends OpenFile {
 
   stat(): Stat {
     return pseudoStat('chardev', S_IFCHR | 0o620, 0)
+  }
+
+  override readiness(): Readiness {
+    return this.pty.slaveReadiness()
+  }
+
+  override watchReadiness(listener: () => void): () => void {
+    return this.pty.watch(listener)
   }
 
   protected override closed(): void {

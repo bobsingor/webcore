@@ -1,0 +1,39 @@
+--- a/coreutils/timeout.c
++++ b/coreutils/timeout.c
+@@ -77,7 +77,7 @@
+ 	duration_t kill_timeout;
+ 	pid_t pid;
+ #if !BB_MMU
+-	char *sv1, *sv2;
++	char *sv0, *sv1, *sv2;
+ #endif
+ 	const char *opt_s = "TERM";
+ 	char *opt_k = NULL;
+@@ -100,7 +100,7 @@
+ 	if (!argv[optind])
+ 		bb_show_usage();
+ 	timeout = parse_duration_str(argv[optind++]);
+-	if (!argv[optind]) /* no PROG? */
++	if (!argv[optind] && !parent) /* no PROG? (the re-execed watcher has none) */
+ 		bb_show_usage();
+ 
+ 	/* We want to create a grandchild which will watch
+@@ -115,6 +115,7 @@
+ 		goto grandchild;
+ 
+ #if !BB_MMU
++	sv0 = argv[optind - 1];
+ 	sv1 = argv[optind];
+ 	sv2 = argv[optind + 1];
+ #endif
+@@ -123,7 +124,9 @@
+ 		/* Child: spawn grandchild and exit */
+ 		parent = getppid();
+ #if !BB_MMU
+-		argv[optind] = xasprintf("-p%u", parent);
++		/* "-p PID SECS": option parsing stops at the first non-option */
++		argv[optind - 1] = xasprintf("-p%u", parent);
++		argv[optind] = sv0;
+ 		argv[optind + 1] = NULL;
+ #endif
+ 		/* NB: exits with nonzero on error: */

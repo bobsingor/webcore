@@ -26,7 +26,6 @@ export function processBindings() {
       const hrtimeBigInt = new BigUint64Array(hrtimeBuffer.buffer, 0, 1)
       const nowNs = () => BigInt(Math.round((host.performance.timeOrigin + host.performance.now()) * 1e6))
       const started = host.performance.now()
-      let umask = 0o022
       let title = 'node'
       let debugPort = 9229
       const memory = () => (performance as { memory?: { usedJSHeapSize: number; totalJSHeapSize: number } }).memory
@@ -50,11 +49,7 @@ export function processBindings() {
             throw uvException(error, 'chdir', directory)
           }
         },
-        umask: (mask?: number) => {
-          const previous = umask
-          if (mask !== undefined) umask = mask & 0o777
-          return previous
-        },
+        umask: (mask?: number) => realm.sys.call('umask', mask ?? null),
         uptime: () => (host.performance.now() - started) / 1000,
         reallyExit: (code: number) => realm.loop.reallyExit(code | 0),
         abort: () => realm.loop.reallyExit(134),

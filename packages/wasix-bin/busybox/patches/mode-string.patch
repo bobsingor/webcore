@@ -1,0 +1,18 @@
+--- a/libbb/mode_string.c
++++ b/libbb/mode_string.c
+@@ -22,13 +22,9 @@
+  || ( S_IFREG != 0100000 ) || ( S_IFBLK != 0060000 ) \
+  || ( S_IFDIR != 0040000 ) || ( S_IFCHR != 0020000 ) \
+  || ( S_IFIFO != 0010000 )
+-# warning mode type bitflag value assumption(s) violated! falling back to larger version
++/* WASI's libc numbers S_IFIFO and S_IFSOCK its own way. Narrowing mode_t here, as upstream does,
++ * would contradict bb_mode_string's declaration in libbb.h. */
+ 
+-# if (S_IRWXU | S_IRWXG | S_IRWXO | S_ISUID | S_ISGID | S_ISVTX) == 07777
+-#  undef mode_t
+-#  define mode_t unsigned short
+-# endif
+-
+ static const mode_t mode_flags[] ALIGN4 = {
+ 	S_IRUSR, S_IWUSR, S_IXUSR, S_ISUID,
+ 	S_IRGRP, S_IWGRP, S_IXGRP, S_ISGID,

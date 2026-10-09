@@ -1,5 +1,5 @@
 ;; cat [files...] — copies files (or stdin, or "-") to stdout.
-;; Absolute paths open relative to preopen fd 3 ("/"), relative paths relative to fd 4 (".").
+;; Paths open relative to fd 3, the first preopen (node:wasi preopens what it is given there).
 (module
   (import "wasi_snapshot_preview1" "args_sizes_get" (func $args_sizes_get (param i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "args_get" (func $args_get (param i32 i32) (result i32)))

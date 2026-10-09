@@ -1,6 +1,6 @@
 # 0018. Signals are dispositions in the kernel; terminals are kernel PTYs
 
-- **Status:** Accepted · implemented in M2a
+- **Status:** Accepted · implemented in M2a; stop and continue in M2c ([0020](0020-wasix-personality.md))
 - **Date:** 2026-10-09
 
 ## Context

@@ -5,6 +5,8 @@
 //   byte 8   i32 kind    none | number | bytes | json
 //   byte 12  i32 length  payload length in bytes
 //   byte 16  f64 number  numeric result
+//   byte 24  i32 bell    doorbell: non-zero when the kernel holds something for a WASI process
+//                        between syscalls (a signal to handle, a stop); it checks after each call
 //   byte 28  i32 park    never written; `exit` parks on it until the Worker is terminated
 //   byte 32  ...         payload area
 import { Errno } from './errno.ts'
@@ -17,6 +19,7 @@ const STATE = 0
 const ERRNO = 1
 const KIND = 2
 const LENGTH = 3
+const BELL = 6
 const PARK = 7
 const NUMBER_OFFSET = 16
 
@@ -86,6 +89,28 @@ export function awaitSync(page: SharedArrayBuffer): { errno: number; value: Sysc
   else if (kind === KIND_JSON) value = JSON.parse(decoder.decode(new Uint8Array(page, HEADER_BYTES, length).slice()))
   Atomics.store(header, STATE, IDLE)
   return { errno, value }
+}
+
+/** Kernel side: ring the doorbell, waking a process that sleeps on it. */
+export function ringBell(page: SharedArrayBuffer): void {
+  const header = new Int32Array(page, 0, 8)
+  Atomics.store(header, BELL, 1)
+  Atomics.notify(header, BELL)
+}
+
+/** Kernel side: the process has taken what the doorbell announced. */
+export function clearBell(page: SharedArrayBuffer): void {
+  Atomics.store(new Int32Array(page, 0, 8), BELL, 0)
+}
+
+/** Process side: whether the doorbell rang. */
+export function bellRang(page: SharedArrayBuffer): boolean {
+  return Atomics.load(new Int32Array(page, 0, 8), BELL) !== 0
+}
+
+/** Process side: sleep for up to `ms` (Infinity: until it rings), waking when the doorbell rings. */
+export function sleepUntilBell(page: SharedArrayBuffer, ms: number): void {
+  Atomics.wait(new Int32Array(page, 0, 8), BELL, 0, ms)
 }
 
 /** Process side: block forever. Used after `exit`; the kernel terminates the Worker. */

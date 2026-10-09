@@ -32,6 +32,7 @@ import { familyOf, isLocalAddress } from '../../../kernel/net.ts'
 import { bytesOf, encode } from '../codec.ts'
 import { host } from '../host.ts'
 import type { Realm } from '../realm.ts'
+import { Errno } from '../../../abi/errno.ts'
 import { SysError } from '../../../process/syscalls.ts'
 import { uvCode } from '../uv.ts'
 import { envFromPairs, signalName } from './child.ts'
@@ -653,7 +654,10 @@ export function createStreams(realm: Realm) {
         // The child's last output first, then its exit.
         await Promise.all(outputs.map((handle) => handle?.drained?.(50)))
         this.setActive(false)
-        loop.callback(() => this.onexit?.call(this, code ?? 0, signalName(signal) ?? ''))
+        loop.callback(() => {
+          this.#exited = true
+          this.onexit?.call(this, code ?? 0, signalName(signal) ?? '')
+        })
       })
       return 0
     }
@@ -663,9 +667,15 @@ export function createStreams(realm: Realm) {
         sys.call('kill', this.pid, signal)
         return 0
       } catch (error) {
+        // libuv reaps a child just before its exit callback, so until then kill reaches a zombie
+        // and succeeds. The kernel's wait reaps it at once, and pids aren't reused: ESRCH before
+        // the exit callback means the child has exited.
+        if (error instanceof SysError && error.errno === Errno.ESRCH && !this.#exited) return 0
         return uvCode(error)
       }
     }
+
+    #exited = false
   }
 
   return { streamBaseState, HandleWrap, StreamHandle, Pipe, TCP, TTY, Process }
