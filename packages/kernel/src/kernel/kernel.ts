@@ -13,8 +13,9 @@ import {
 import { completeSync, createPage, DEFAULT_PAGE_BYTES, pageCapacity } from '../abi/page.ts'
 import type { BootMessage, SyscallReply, SyscallRequest } from '../abi/protocol.ts'
 import { SPAWN_SYNC_HEADER_BYTES } from '../abi/syscalls.ts'
-import type { SpawnSyncRequest, SyscallArgs, SyscallName, SyscallReturn, SyscallValue } from '../abi/syscalls.ts'
+import type { SocketInfo, SpawnSyncRequest, SyscallArgs, SyscallName, SyscallReturn, SyscallValue } from '../abi/syscalls.ts'
 import { EventBus } from './events.ts'
+import { Listener, Network, Socket } from './net.ts'
 import { resolveExecutable, type Executable } from './exec.ts'
 import { DeviceHandle, DirHandle, FileHandle, PipeReader, PipeWriter, type OpenFile } from './files.ts'
 import { normalize, resolve } from './path.ts'
@@ -62,6 +63,8 @@ const encoder = new TextEncoder()
 export class Kernel {
   readonly fs = new MemFS()
   readonly events = new EventBus()
+  /** Virtual TCP: listening ports and connections (ADR-0014). */
+  readonly net = new Network(this.events)
   private readonly host: ProcessHost
   private readonly pageBytes: number
   private readonly procs = new Map<number, Process>()
@@ -121,6 +124,14 @@ export class Kernel {
   /** Opens a file outside any process (e.g. for shell redirection). The caller owns the reference. */
   open(path: string, flags: number, mode = 0o666): OpenFile {
     return this.openPath(normalize(path), flags, mode)
+  }
+
+  /**
+   * Opens a TCP connection to a process listening on `port`, as a client outside any process (the
+   * preview bridge). The caller owns the returned socket and must release() it.
+   */
+  connect(port: number, address = '127.0.0.1'): Socket {
+    return this.net.connect(address, port)
   }
 
   getProcess(pid: number): Process | undefined {
@@ -352,6 +363,31 @@ export class Kernel {
 
     spawnSync: (proc, argv, request) => this.spawnSync(proc, argv, request),
 
+    listen: (proc, address, port) => {
+      if (typeof address !== 'string') throw kerr('EINVAL')
+      const listener = this.net.listen(address, Number(port), proc.pid)
+      return [proc.allocFd(listener), listener.local.port]
+    },
+
+    accept: async (proc, fd) => {
+      const listener = proc.getFd(fd)
+      if (!(listener instanceof Listener)) throw kerr(listener.type === 'socket' ? 'EINVAL' : 'ENOTSOCK')
+      const socket = await listener.accept(proc.abort.signal)
+      return this.installSocket(proc, socket)
+    },
+
+    connect: (proc, address, port) => {
+      if (typeof address !== 'string') throw kerr('EINVAL')
+      return this.installSocket(proc, this.net.connect(address, Number(port)))
+    },
+
+    shutdown: (proc, fd) => {
+      const socket = proc.getFd(fd)
+      if (!(socket instanceof Socket)) throw kerr(socket.type === 'socket' ? 'ENOTCONN' : 'ENOTSOCK')
+      socket.shutdown()
+      return 0
+    },
+
     wait: async (proc, pid) => {
       const child = this.procs.get(pid)
       if (!child || child.ppid !== proc.pid) throw kerr('ECHILD')
@@ -438,6 +474,15 @@ export class Kernel {
     out.set(stdout, SPAWN_SYNC_HEADER_BYTES)
     out.set(stderr, SPAWN_SYNC_HEADER_BYTES + stdout.length)
     return out
+  }
+
+  private installSocket(proc: Process, socket: Socket): SocketInfo {
+    // An accept can complete after its process died; the connection must not leak.
+    if (!proc.alive) {
+      socket.release()
+      throw kerr('EBADF')
+    }
+    return { fd: proc.allocFd(socket), local: socket.local, peer: socket.peer }
   }
 
   private resolveAt(proc: Process, dirfd: number, path: string): string {

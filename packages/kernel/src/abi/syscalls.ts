@@ -29,6 +29,21 @@ export interface SpawnRequest {
   fds?: [number, number, number]
 }
 
+export type AddressFamily = 'IPv4' | 'IPv6'
+
+export interface SocketAddress {
+  address: string
+  family: AddressFamily
+  port: number
+}
+
+/** A connected socket: its fd plus both ends' addresses. */
+export interface SocketInfo {
+  fd: number
+  local: SocketAddress
+  peer: SocketAddress
+}
+
 /**
  * The kernel syscall surface, as seen from a process. This is the single source of truth for the
  * names, arguments and results that cross the process/kernel boundary. `exit` is handled separately
@@ -59,6 +74,14 @@ export interface Syscalls {
   waitStatus(pid: number): [code: number | null, signal: number | null]
   /** Runs a child to completion, inside the kernel (see SPAWN_SYNC_HEADER_BYTES). */
   spawnSync(argv: string[], request: SpawnSyncRequest): Uint8Array
+  /** Listens for virtual TCP connections (ADR-0014). Port 0 picks a free port. */
+  listen(address: string, port: number): [fd: number, port: number]
+  /** Waits for the next connection on a listening socket. */
+  accept(fd: number): SocketInfo
+  /** Connects to a local listener; fails with ECONNREFUSED when nothing listens on `port`. */
+  connect(address: string, port: number): SocketInfo
+  /** Closes a socket's write direction (SHUT_WR): the peer reads EOF. */
+  shutdown(fd: number): number
 }
 
 export type SyscallName = keyof Syscalls

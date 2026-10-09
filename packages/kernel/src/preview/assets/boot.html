@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Starting preview…</title>
+    <style>
+      html {
+        color-scheme: light dark;
+      }
+      body {
+        margin: 0;
+        height: 100vh;
+        display: grid;
+        place-items: center;
+        font: 13px system-ui, sans-serif;
+        color: #888;
+      }
+    </style>
+    <script src="/__webcore/client.js"></script>
+  </head>
+  <body>
+    <p id="status">Starting preview…</p>
+    <script>
+      // Installs the preview Service Worker, connects it to the bridge in the embedding page, then
+      // loads the page this preview is for: ?path= when opened as the boot page, otherwise the URL
+      // it was served at (the worker had lost its connection and fell back to this page).
+      ;(async () => {
+        const status = document.getElementById('status')
+        const fail = (text) => (status.textContent = text)
+        if (window.parent === window) return fail('This is a webcore preview. Open it from the page that runs webcore.')
+        if (!navigator.serviceWorker) return fail('Previews need Service Workers, which this browser context does not allow.')
+        try {
+          const registration = await navigator.serviceWorker.register('/__webcore_sw.js', { scope: '/' })
+          await navigator.serviceWorker.ready
+          const worker = registration.active
+          if (!(await window.__webcore.connectWorker(worker))) return fail('Could not connect the preview to webcore.')
+          if (location.pathname === '/__webcore/boot.html') location.replace(new URLSearchParams(location.search).get('path') || '/')
+          else location.reload()
+        } catch (error) {
+          fail(`Could not start the preview: ${error.message}`)
+        }
+      })()
+    </script>
+  </body>
+</html>

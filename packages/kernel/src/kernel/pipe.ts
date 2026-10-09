@@ -31,7 +31,7 @@ export class Pipe {
   async read(max: number, signal?: AbortSignal): Promise<Uint8Array> {
     for (;;) {
       if (this.buffered > 0) return this.take(max)
-      if (!this.writeOpen) return EMPTY
+      if (!this.writeOpen || !this.readOpen) return EMPTY
       await this.park(this.readers, signal)
     }
   }
@@ -51,11 +51,13 @@ export class Pipe {
     }
   }
 
+  /** Discards buffered data; pending writes fail with EPIPE and pending reads return EOF. */
   closeRead(): void {
     this.readOpen = false
     this.chunks = []
     this.buffered = 0
     this.wake(this.writers)
+    this.wake(this.readers)
   }
 
   closeWrite(): void {

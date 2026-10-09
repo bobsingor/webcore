@@ -224,7 +224,7 @@ export class PipeWriter extends OpenFile {
   }
 }
 
-function pseudoStat(type: FileType, mode: number, size: number): Stat {
+export function pseudoStat(type: FileType, mode: number, size: number): Stat {
   const now = Date.now()
   return { type, mode, ino: 0, nlink: 1, size, atimeMs: now, mtimeMs: now, ctimeMs: now, birthtimeMs: now }
 }

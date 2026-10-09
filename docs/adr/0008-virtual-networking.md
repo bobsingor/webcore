@@ -1,6 +1,6 @@
 # 0008. Virtual sockets in the kernel; Service Worker preview; optional TCP relay
 
-- **Status:** Accepted
+- **Status:** Accepted · loopback TCP and previews implemented in M1c ([0014](0014-preview-bridge.md))
 - **Date:** 2026-10-09
 
 ## Context

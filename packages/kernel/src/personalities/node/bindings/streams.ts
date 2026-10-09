@@ -1,10 +1,12 @@
 // Node's libuv handle layer on kernel file descriptors: HandleWrap, LibuvStreamWrap
-// (src/stream_base.cc), pipe_wrap, tty_wrap, tcp_wrap (a shell until M1c), process_wrap and a
-// minimal cares_wrap.
+// (src/stream_base.cc), pipe_wrap, tty_wrap, tcp_wrap (virtual TCP, ADR-0014), process_wrap and
+// cares_wrap (localhost only).
 //
 // Reads: readStart() pumps async read syscalls; each chunk is delivered as onread(arrayBuffer)
 // with streamBaseState[kReadBytesOrError] set, and UV_EOF at the end. Writes complete
 // asynchronously through req.oncomplete(status). An active, referenced handle keeps the loop alive.
+import type { SocketAddress, SocketInfo } from '../../../abi/syscalls.ts'
+import { familyOf, isLocalAddress } from '../../../kernel/net.ts'
 import { bytesOf, encode } from '../codec.ts'
 import type { Realm } from '../realm.ts'
 import { SysError } from '../../../process/syscalls.ts'
@@ -17,8 +19,12 @@ const kBytesWritten = 2
 const kLastWriteWasAsync = 3
 const UV_EOF = -4095
 const UV_EBADF = -9
+const UV_EINVAL = -22
 const UV_ENOSYS = -38
+const UV_ENOTCONN = -107
+const UV_EAI_NONAME = -3008
 const READ_CHUNK = 64 * 1024
+const DNS_ORDER_IPV6_FIRST = 2
 
 type Request = { oncomplete?: (...args: unknown[]) => void; handle?: unknown }
 
@@ -92,6 +98,7 @@ export function createStreams(realm: Realm) {
     private pumping = false
     private pendingWrites = 0
     private shut = false
+    private fdReleased = false
 
     readStart(): number {
       if (this.fd < 0) return UV_EBADF
@@ -151,11 +158,10 @@ export function createStreams(realm: Realm) {
     shutdown(req: Request): number {
       if (this.fd < 0) return UV_EBADF
       const finish = () => {
-        const fd = this.fd
         this.shut = true
         let status = 0
         try {
-          if (fd >= 0) sys.call('close', fd)
+          if (this.fd >= 0) this.shutdownWrite()
         } catch (error) {
           status = uvCode(error)
         }
@@ -166,9 +172,15 @@ export function createStreams(realm: Realm) {
       return 0
     }
 
+    /** Sends EOF. A pipe has no half-close, so this closes our end; sockets override it. */
+    protected shutdownWrite(): void {
+      sys.call('close', this.fd)
+      this.fdReleased = true
+    }
+
     protected override onClose(): void {
       this.wantRead = false
-      if (this.fd >= 0 && !this.shut) {
+      if (this.fd >= 0 && !this.fdReleased) {
         try {
           sys.call('close', this.fd)
         } catch {
@@ -235,8 +247,13 @@ export function createStreams(realm: Realm) {
       })
     }
 
-    private updateActive(): void {
-      this.setActive(!this.closed && (this.wantRead || this.pendingWrites > 0))
+    /** Whether pending work keeps the handle active (and the loop alive while referenced). */
+    protected busy(): boolean {
+      return this.wantRead || this.pendingWrites > 0
+    }
+
+    protected updateActive(): void {
+      this.setActive(!this.closed && this.busy())
     }
   }
 
@@ -268,44 +285,152 @@ export function createStreams(realm: Realm) {
 
   class TCP extends StreamHandle {
     readonly type: number
+    onconnection?: (this: TCP, status: number, client?: TCP) => void
+    private bound?: { address: string; port: number }
+    private local?: SocketAddress
+    private peer?: SocketAddress
+    private listening = false
+    private connecting = false
+
     constructor(type = 0) {
       super()
       this.type = type
     }
+
     open(fd: number): number {
       this.fd = fd
       return 0
     }
-    // Virtual TCP arrives with networking (M1c).
-    bind(): number {
-      return UV_ENOSYS
+
+    // Binding only records the address: like libuv, errors such as EADDRINUSE surface at listen().
+    bind(address: string, port: number): number {
+      return this.recordBind(address, port)
     }
-    bind6(): number {
-      return UV_ENOSYS
+
+    bind6(address: string, port: number): number {
+      return this.recordBind(address, port)
     }
-    listen(): number {
-      return UV_ENOSYS
+
+    listen(_backlog: number): number {
+      const { address, port } = this.bound ?? { address: '0.0.0.0', port: 0 }
+      try {
+        const [fd, actual] = sys.call('listen', address, port)
+        this.fd = fd
+        this.local = { address, family: familyOf(address) ?? 'IPv4', port: actual }
+      } catch (error) {
+        if (!(error instanceof SysError)) throw error
+        return uvCode(error)
+      }
+      this.listening = true
+      this.updateActive()
+      void this.acceptLoop()
+      return 0
     }
-    connect(): number {
-      return UV_ENOSYS
+
+    connect(req: Request, address: string, port: number): number {
+      return this.startConnect(req, address, port)
     }
-    connect6(): number {
-      return UV_ENOSYS
+
+    connect6(req: Request, address: string, port: number): number {
+      return this.startConnect(req, address, port)
     }
-    getsockname(): number {
-      return UV_ENOSYS
+
+    getsockname(out: Record<string, unknown>): number {
+      const local = this.local ?? (this.bound && { ...this.bound, family: familyOf(this.bound.address) ?? 'IPv4' })
+      if (!local) return UV_EINVAL
+      Object.assign(out, local)
+      return 0
     }
-    getpeername(): number {
-      return UV_ENOSYS
+
+    getpeername(out: Record<string, unknown>): number {
+      if (!this.peer) return UV_ENOTCONN
+      Object.assign(out, this.peer)
+      return 0
     }
+
     setNoDelay(): number {
       return 0
     }
+
     setKeepAlive(): number {
       return 0
     }
-    reset(): number {
+
+    setSimultaneousAccepts(): void {}
+
+    /** An abortive close (RST). The peer sees the connection end. */
+    reset(callback?: () => void): number {
+      this.close(callback)
       return 0
+    }
+
+    /** Wraps a connection accepted by a listener. */
+    adopt(info: SocketInfo): this {
+      this.fd = info.fd
+      this.local = info.local
+      this.peer = info.peer
+      return this
+    }
+
+    protected override shutdownWrite(): void {
+      sys.call('shutdown', this.fd)
+    }
+
+    protected override busy(): boolean {
+      return super.busy() || this.listening || this.connecting
+    }
+
+    protected override onClose(): void {
+      this.listening = false
+      super.onClose()
+    }
+
+    private recordBind(address: string, port: number): number {
+      if (!familyOf(address)) return UV_EINVAL
+      this.bound = { address, port }
+      return 0
+    }
+
+    private startConnect(req: Request, address: string, port: number): number {
+      let status = 0
+      try {
+        this.adopt(sys.call('connect', address, port))
+      } catch (error) {
+        if (!(error instanceof SysError)) throw error
+        status = uvCode(error)
+      }
+      // Connection results are always asynchronous, even an immediate ECONNREFUSED.
+      this.connecting = true
+      this.updateActive()
+      loop.defer(() => {
+        this.connecting = false
+        this.updateActive()
+        if (this.closed) return
+        loop.callback(() => req.oncomplete?.call(req, status, this, req, true, true))
+      })
+      return 0
+    }
+
+    private async acceptLoop(): Promise<void> {
+      while (!this.closed) {
+        let info: SocketInfo
+        try {
+          info = await sys.callAsync('accept', this.fd)
+        } catch (error) {
+          if (!this.closed) loop.callback(() => this.onconnection?.call(this, uvCode(error)))
+          return
+        }
+        if (this.closed) {
+          try {
+            sys.call('close', info.fd)
+          } catch {
+            // The process is exiting.
+          }
+          return
+        }
+        const client = new TCP(0).adopt(info)
+        loop.callback(() => this.onconnection?.call(this, 0, client))
+      }
     }
   }
 
@@ -466,12 +591,24 @@ export function streamBindings() {
       }
       return { UDP, SendWrap: class SendWrap {}, constants: { UV_UDP_IPV6ONLY: 1, UV_UDP_REUSEPORT: 8 } }
     },
-    // DNS arrives with networking (M1c); net needs these classes to load.
-    cares_wrap: () => ({
-      GetAddrInfoReqWrap: class GetAddrInfoReqWrap {},
-      GetNameInfoReqWrap: class GetNameInfoReqWrap {},
-      QueryReqWrap: class QueryReqWrap {},
-      ChannelWrap: class ChannelWrap {
+    // Name resolution: only the virtual host exists (localhost and *.localhost, ADR-0014). IP
+    // literals never get here; dns.lookup() answers those itself.
+    cares_wrap: (realm: Realm) => {
+      const { loop } = realm
+      const LOCAL_NAMES = new Set(['localhost', 'webcore'])
+      const isLocalName = (name: string) => {
+        const lower = name.toLowerCase().replace(/\.$/, '')
+        return LOCAL_NAMES.has(lower) || lower.endsWith('.localhost')
+      }
+      const complete = (req: { oncomplete?: (...args: unknown[]) => void }, ...args: unknown[]) => {
+        loop.requestStarted()
+        loop.defer(() => {
+          loop.requestFinished()
+          loop.callback(() => req.oncomplete?.call(req, ...args))
+        })
+        return 0
+      }
+      class ChannelWrap {
         getServers() {
           return []
         }
@@ -480,18 +617,30 @@ export function streamBindings() {
         }
         setLocalAddress() {}
         cancel() {}
-      },
-      getaddrinfo: () => UV_ENOSYS,
-      getnameinfo: () => UV_ENOSYS,
-      canonicalizeIP: (ip: string) => ip,
-      convertIpv6StringToBuffer: () => null,
-      strerror: (code: number) => `DNS error ${code}`,
-      AI_ADDRCONFIG: 1024,
-      AI_ALL: 256,
-      AI_V4MAPPED: 2048,
-      DNS_ORDER_VERBATIM: 0,
-      DNS_ORDER_IPV4_FIRST: 1,
-      DNS_ORDER_IPV6_FIRST: 2,
-    }),
+      }
+      return {
+        GetAddrInfoReqWrap: class GetAddrInfoReqWrap {},
+        GetNameInfoReqWrap: class GetNameInfoReqWrap {},
+        QueryReqWrap: class QueryReqWrap {},
+        ChannelWrap,
+        getaddrinfo: (req: object, hostname: string, family: number, _hints: number, order: number) => {
+          if (!isLocalName(hostname)) return complete(req, UV_EAI_NONAME, null)
+          const v4 = family === 6 ? [] : ['127.0.0.1']
+          const v6 = family === 4 ? [] : ['::1']
+          return complete(req, 0, order === DNS_ORDER_IPV6_FIRST ? [...v6, ...v4] : [...v4, ...v6])
+        },
+        getnameinfo: (req: object, host: string, port: number) =>
+          isLocalAddress(host) ? complete(req, 0, 'localhost', String(port)) : complete(req, UV_EAI_NONAME),
+        canonicalizeIP: (ip: string) => (familyOf(ip) ? ip.toLowerCase() : undefined),
+        convertIpv6StringToBuffer: () => null,
+        strerror: (code: number) => (code === UV_EAI_NONAME ? 'unknown node or service' : `DNS error ${code}`),
+        AI_ADDRCONFIG: 1024,
+        AI_ALL: 256,
+        AI_V4MAPPED: 2048,
+        DNS_ORDER_VERBATIM: 0,
+        DNS_ORDER_IPV4_FIRST: 1,
+        DNS_ORDER_IPV6_FIRST,
+      }
+    },
   }
 }

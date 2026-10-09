@@ -6,6 +6,8 @@ export type KernelEventBody =
   | { type: 'process.spawn'; pid: number; ppid: number; argv: string[]; cwd: string }
   | { type: 'process.exit'; pid: number; code: number }
   | { type: 'fs.change'; op: FsOp; path: string; to?: string }
+  | { type: 'net.listen'; pid: number; port: number; address: string }
+  | { type: 'net.close'; pid: number; port: number }
 
 export type KernelEvent = KernelEventBody & { seq: number; time: number }
 

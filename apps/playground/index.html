@@ -10,7 +10,7 @@
       <div class="brand">
         <span class="logo" aria-hidden="true"></span>
         <span class="name">webcore</span>
-        <span class="tag">M1b · Node.js + ES modules</span>
+        <span class="tag">M1c · Networking + preview</span>
       </div>
       <div id="status" class="status" data-state="booting">booting kernel…</div>
     </header>
@@ -22,6 +22,18 @@
           <label id="ps1" class="ps1" for="input"></label>
           <input id="input" autocomplete="off" autocapitalize="off" spellcheck="false" disabled />
         </form>
+      </section>
+
+      <section id="preview" class="preview" aria-label="Preview" hidden>
+        <div class="preview-bar">
+          <div id="ports" class="ports" role="tablist" aria-label="Listening ports"></div>
+          <form id="address" class="address">
+            <span id="address-port" class="address-port"></span>
+            <input id="address-path" aria-label="Preview path" autocomplete="off" spellcheck="false" />
+          </form>
+          <button id="reload" class="icon" type="button" title="Reload preview" aria-label="Reload preview">↻</button>
+        </div>
+        <iframe id="frame" title="Preview"></iframe>
       </section>
 
       <aside class="side">

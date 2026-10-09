@@ -1,6 +1,6 @@
 # 0009. Runtime and previews live on their own origins
 
-- **Status:** Accepted
+- **Status:** Accepted · preview origins implemented in M1c ([0014](0014-preview-bridge.md))
 - **Date:** 2026-10-09
 
 ## Context

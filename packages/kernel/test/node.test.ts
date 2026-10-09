@@ -25,8 +25,9 @@ describe('runtime', () => {
   })
 
   it('orders ticks, promises, immediates and timers like Node', async () => {
+    // As in Node, an expired timer runs before immediates, so the delay must outlast a busy machine.
     const { stdout } = await node(
-      "setTimeout(() => console.log('timeout'), 20); setImmediate(() => console.log('immediate')); process.nextTick(() => console.log('tick')); Promise.resolve().then(() => console.log('promise')); console.log('sync')",
+      "setTimeout(() => console.log('timeout'), 100); setImmediate(() => console.log('immediate')); process.nextTick(() => console.log('tick')); Promise.resolve().then(() => console.log('promise')); console.log('sync')",
     )
     expect(stdout).toBe('sync\ntick\npromise\nimmediate\ntimeout\n')
   })
@@ -79,8 +80,8 @@ describe('bindings', () => {
       "const failed = []; for (const id of require('module').builtinModules) { try { require(id) } catch { failed.push(id) } } console.log(failed.join(' '))",
     )
     const later = [
-      // http_parser and virtual TCP (M1c)
-      '_http_client', '_http_common', '_http_outgoing', '_http_server', 'http', 'http2',
+      // nghttp2 (not scheduled yet)
+      'http2',
       // crypto and zlib (M1d)
       '_tls_common', '_tls_wrap', 'crypto', 'https', 'tls', 'zlib',
       // vm contexts; V8 serializer

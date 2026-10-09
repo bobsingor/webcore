@@ -61,7 +61,7 @@ const LINUX_TO_WASI = new Map<number, number>([
   [Errno.EXDEV, 75],
 ])
 
-const FILETYPE: Record<FileType, number> = { chardev: 2, dir: 3, file: 4, fifo: 0 }
+const FILETYPE: Record<FileType, number> = { chardev: 2, dir: 3, file: 4, fifo: 0, socket: 6 }
 
 const RIGHT_FD_READ = 1n << 1n
 const RIGHT_FD_WRITE = 1n << 6n

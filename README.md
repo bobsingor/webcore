@@ -9,17 +9,17 @@ WebContainers, but open, multi-language from the kernel up, and designed to be d
 
 The core idea: **the kernel and its syscall ABI are the product; languages and databases are just
 executables.** Every command is a real process in its own Worker. All processes share one kernel:
-processes, file descriptors, pipes, a filesystem, and (soon) virtual sockets. JavaScript runs on the
+processes, file descriptors, pipes, a filesystem, and virtual sockets. JavaScript runs on the
 browser's own JIT. Everything else runs as WebAssembly.
 
 Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design and roadmap, and
 [docs/adr/](docs/adr/README.md) for the decisions behind it.
 
-## Status: M1b, real Node.js with ES modules ✅
+## Status: M1c, networking and preview ✅
 
 `node` is **Node.js v24.21.0**: Node's own JavaScript standard library, unmodified, running on the
 browser's JavaScript engine over bindings written against the kernel. The bindings replace the C++
-half of Node (ADR-0005, ADR-0012).
+half of Node (ADR-0005, ADR-0012). Servers it starts open in a preview pane (ADR-0014).
 
 ```sh
 user@webcore:~$ node -p "process.version + ' on ' + process.platform"
@@ -35,6 +35,7 @@ What works:
   - processes, fd tables, pipes with blocking reads, backpressure, EOF and EPIPE
   - an in-memory VFS, `spawn`/`wait`/`kill`, signals reported as signals
   - a kernel-side `spawnSync`
+  - virtual TCP on one loopback host: `listen`/`accept`/`connect`/`shutdown` (ADR-0014)
 - **Syscall ABI:** Linux semantics and errno values. Sync calls block on a shared-memory page. Async
   calls go over a MessagePort, so Node's event loop keeps running.
 - **Node.js:**
@@ -46,9 +47,12 @@ What works:
   - ES modules: imports, live bindings, cycles, top-level await, `import.meta`, `import()`, JSON,
     and CommonJS interop including `require(esm)` (ADR-0013). The real `create-vite` CLI
     scaffolds a React app
-  - 55 of 72 builtin modules load; the rest are scheduled (see [the M1 plan](docs/milestones/M1.md))
+  - `net`, `http` and `dns` over the kernel's sockets, between processes or within one
+  - 60 of 72 builtin modules load; the rest are scheduled (see [the M1 plan](docs/milestones/M1.md))
+- **Preview:** a server listening on a port is served in an iframe on `p<port>.localhost`, through a
+  Service Worker and a bridge to the kernel. Page requests, cookies and WebSockets work (ADR-0014).
 - **WASI preview1:** args, env, preopens, files, directories, pipes, clocks, random, sleeps.
-- **Structured events:** spawn, exit and fs changes (ADR-0010).
+- **Structured events:** spawn, exit, fs changes, and ports opening and closing (ADR-0010).
 - **Hosts:** browser (`@webcore/kernel/web`) and headless Node (`@webcore/kernel/node`).
 
 ## Quick start
@@ -65,8 +69,8 @@ pnpm dev
 
 `pnpm dev` builds the WASI test binaries and the Node standard library bundle first.
 
-`pnpm dev` opens the playground at http://localhost:5180: a terminal, example commands, and a live
-kernel event log.
+`pnpm dev` opens the playground at http://localhost:5180: a terminal, example commands, a preview
+pane, and a live kernel event log. Try "HTTP server + preview".
 
 ```bash
 pnpm test
@@ -90,7 +94,9 @@ packages/
     src/kernel/          Kernel, processes, VFS, pipes, open files, exec resolution, events
     src/process/         Worker entries (browser, Node) and the process-side syscall client
     src/personalities/   wasi.ts (WASI preview1), node/ (Node.js: realm, event loop, bindings)
-    src/host/            ProcessHosts, exec/pipeline helpers, mini shell, root filesystem
+    src/host/            ProcessHosts, exec/pipeline helpers, mini shell, root filesystem, HTTP client
+    src/lib/             environment-free libraries (the HTTP/1.1 parser)
+    src/preview/         preview bridge, Service Worker, client script, Vite plugin (ADR-0014)
     test/                unit + end-to-end tests
   node-lib/              Node v24.21.0's lib/, vendored, plus the bundle builder (ADR-0012)
   wat-bin/               hand-written WASI programs (echo, cat, wc, ls), no C toolchain needed
@@ -114,9 +120,23 @@ const { code, stdout } = await exec(kernel, ['node', '-p', '6 * 7'], { env: { ..
 The page must be cross-origin isolated (`Cross-Origin-Opener-Policy: same-origin`,
 `Cross-Origin-Embedder-Policy: require-corp`). See ADR-0002 and ADR-0009.
 
+Previews (ADR-0014) need the `webcorePreview()` Vite plugin from `@webcore/kernel/vite` (or the same
+three files and a boot-page fallback on `p<port>.*` hosts), and a bridge on the page:
+
+```ts
+import { PreviewBridge } from '@webcore/kernel'
+
+const bridge = new PreviewBridge(kernel) // previews on p<port>.localhost:<this page's port>
+bridge.listen()
+kernel.events.subscribe((event) => {
+  if (event.type === 'net.listen') iframe.src = bridge.url(event.port)
+})
+```
+
 ## Known limitations
 
-- **No networking yet**: `net`, `http`, DNS (M1c).
+- **Networking is local only**: no outbound `http(s)` (M1d), Unix domain sockets, UDP or HTTP/2.
+  Previews work inside the page that runs the kernel, not in a tab of their own.
 - **No `crypto` or `zlib` yet**, and **no package installer or `sh` process** (M1d).
 - **No `fs.watch`, `worker_threads` or Wasm native addons** (M1e).
 - **The kernel runs on the page's main thread.** It moves into an isolated iframe in M1e (ADR-0009).

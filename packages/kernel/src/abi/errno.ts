@@ -36,8 +36,18 @@ export const Errno = {
   ENOSYS: 38,
   ENOTEMPTY: 39,
   ELOOP: 40,
-  ENOBUFS: 105,
   EOVERFLOW: 75,
+  ENOTSOCK: 88,
+  EAFNOSUPPORT: 97,
+  EADDRINUSE: 98,
+  EADDRNOTAVAIL: 99,
+  ENETUNREACH: 101,
+  ECONNRESET: 104,
+  ENOBUFS: 105,
+  EISCONN: 106,
+  ENOTCONN: 107,
+  ETIMEDOUT: 110,
+  ECONNREFUSED: 111,
 } as const
 
 export type ErrnoName = keyof typeof Errno
@@ -71,6 +81,16 @@ const messages: Partial<Record<ErrnoName, string>> = {
   ENOTEMPTY: 'directory not empty',
   ELOOP: 'too many symbolic links encountered',
   EOVERFLOW: 'value too large for defined data type',
+  ENOTSOCK: 'socket operation on non-socket',
+  EAFNOSUPPORT: 'address family not supported',
+  EADDRINUSE: 'address already in use',
+  EADDRNOTAVAIL: 'address not available',
+  ENETUNREACH: 'network is unreachable',
+  ECONNRESET: 'connection reset by peer',
+  EISCONN: 'socket is already connected',
+  ENOTCONN: 'socket is not connected',
+  ETIMEDOUT: 'connection timed out',
+  ECONNREFUSED: 'connection refused',
 }
 
 export function errnoName(errno: number): ErrnoName | 'EUNKNOWN' {

@@ -15,7 +15,7 @@ import { uvCode, uvException } from '../uv.ts'
 import { host } from '../host.ts'
 
 const kFsStatsFieldsNumber = 18
-const UV_DIRENT: Record<FileType, number> = { file: 1, dir: 2, fifo: 4, chardev: 6 }
+const UV_DIRENT: Record<FileType, number> = { file: 1, dir: 2, fifo: 4, socket: 5, chardev: 6 }
 const COPYFILE_EXCL = 1
 
 type Request = { oncomplete(error: unknown, value?: unknown): void } | symbol | undefined

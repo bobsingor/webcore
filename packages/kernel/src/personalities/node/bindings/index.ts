@@ -4,6 +4,7 @@ import type { Realm } from '../realm.ts'
 import { childBindings } from './child.ts'
 import { encodingBindings } from './encoding.ts'
 import { fsBindings } from './fs.ts'
+import { httpBindings } from './http.ts'
 import { moduleBindings } from './modules.ts'
 import { processBindings } from './process.ts'
 import { streamBindings } from './streams.ts'
@@ -21,6 +22,7 @@ export function createBindings(): Record<string, BindingFactory> {
     ...moduleBindings(),
     ...childBindings(),
     ...streamBindings(),
+    ...httpBindings(),
     url: urlBinding,
   }
 }

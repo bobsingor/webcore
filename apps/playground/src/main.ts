@@ -1,4 +1,14 @@
-import { createShell, DEFAULT_ENV, installRootfs, installTarball, Kernel, runLine, type KernelEvent } from '@webcore/kernel'
+import {
+  createShell,
+  DEFAULT_ENV,
+  installRootfs,
+  installTarball,
+  Kernel,
+  PreviewBridge,
+  previewPortOf,
+  runLine,
+  type KernelEvent,
+} from '@webcore/kernel'
 import { webProcessHost } from '@webcore/kernel/web'
 import nodeLibUrl from '@webcore/node-lib/node-lib.bin?url'
 import catUrl from '@webcore/wat-bin/cat.wasm?url'
@@ -8,6 +18,53 @@ import wcUrl from '@webcore/wat-bin/wc.wasm?url'
 import './style.css'
 
 const CREATE_VITE = 'https://registry.npmjs.org/create-vite/-/create-vite-9.2.1.tgz'
+
+// The "HTTP server" example: a page plus a JSON endpoint it polls.
+const SERVER_JS = `const http = require('node:http')
+
+let visits = 0
+const started = Date.now()
+
+const page = () => \`<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Hello from webcore</title>
+    <style>
+      body { font: 15px/1.6 system-ui, sans-serif; max-width: 34rem; margin: 3rem auto; padding: 0 1rem; color: #1d2330 }
+      code, pre { font: 13px ui-monospace, Menlo, monospace; background: #f2f4f8; border-radius: 6px }
+      code { padding: 1px 5px } pre { padding: 12px 14px }
+    </style>
+  </head>
+  <body>
+    <h1>Hello from Node.js</h1>
+    <p>This page comes from <code>http.createServer()</code> in Node \${process.version}, running in a
+    Web Worker inside your browser tab. The request reached it over webcore's virtual TCP.</p>
+    <p>Visits: \${visits}. Live stats from <code>/api/stats</code>:</p>
+    <pre id="stats">loading…</pre>
+    <script>
+      const update = async () => {
+        const stats = await (await fetch('/api/stats')).json()
+        document.getElementById('stats').textContent = JSON.stringify(stats, null, 2)
+      }
+      update()
+      setInterval(update, 1000)
+    </script>
+  </body>
+</html>\`
+
+http
+  .createServer((req, res) => {
+    if (req.url === '/api/stats') {
+      res.setHeader('content-type', 'application/json')
+      return res.end(JSON.stringify({ visits, uptime: Math.round((Date.now() - started) / 1000) + 's', pid: process.pid }))
+    }
+    visits++
+    res.setHeader('content-type', 'text/html; charset=utf-8')
+    res.end(page())
+  })
+  .listen(3000, () => console.log('Listening on http://localhost:3000 (Ctrl+C to stop)'))
+`
 
 interface Example {
   label: string
@@ -44,6 +101,13 @@ const EXAMPLES: Example[] = [
   },
   { label: 'Uncaught error', command: `node -e "throw new Error('boom')"` },
   {
+    label: 'HTTP server + preview',
+    command: 'node server.js',
+    prepare: async (kernel) => {
+      kernel.fs.writeFile('/home/user/server.js', SERVER_JS)
+    },
+  },
+  {
     label: 'ES modules',
     command: `node --input-type=module -e "import { basename } from 'node:path'; const { readFileSync } = await import('node:fs'); console.log(basename(import.meta.url), readFileSync('/etc/hostname', 'utf8').trim())"`,
   },
@@ -72,6 +136,12 @@ const ps1 = $<HTMLLabelElement>('ps1')
 const status = $<HTMLDivElement>('status')
 const eventsList = $<HTMLOListElement>('events')
 const eventCount = $<HTMLSpanElement>('event-count')
+const layout = document.querySelector<HTMLElement>('.layout')!
+const preview = $<HTMLElement>('preview')
+const portTabs = $<HTMLDivElement>('ports')
+const addressPort = $<HTMLSpanElement>('address-port')
+const addressPath = $<HTMLInputElement>('address-path')
+const frame = $<HTMLIFrameElement>('frame')
 
 const shell = createShell({ cwd: '/home/user', env: { ...DEFAULT_ENV, PWD: '/home/user' } })
 const history: string[] = []
@@ -105,6 +175,10 @@ function describeEvent(event: KernelEvent): string {
       return `exit   pid ${event.pid}  → ${event.code}`
     case 'fs.change':
       return `fs     ${event.op} ${event.path}${event.to ? ` → ${event.to}` : ''}`
+    case 'net.listen':
+      return `net    pid ${event.pid}  listening on ${event.address}:${event.port}`
+    case 'net.close':
+      return `net    pid ${event.pid}  closed port ${event.port}`
   }
 }
 
@@ -116,6 +190,63 @@ function logEvent(event: KernelEvent): void {
   item.textContent = describeEvent(event)
   eventsList.prepend(item)
   while (eventsList.childElementCount > 200) eventsList.lastElementChild?.remove()
+}
+
+/**
+ * The preview pane: one tab per listening port, showing the port through the PreviewBridge
+ * (ADR-0014). Opens on the first port that starts listening.
+ */
+function setupPreview(kernel: Kernel): void {
+  const bridge = new PreviewBridge(kernel)
+  bridge.listen()
+  const tabs = new Map<number, HTMLButtonElement>()
+  let current: number | undefined
+
+  const show = (port: number, path = '/') => {
+    current = port
+    preview.hidden = false
+    layout.classList.add('has-preview')
+    addressPort.textContent = `localhost:${port}`
+    addressPath.value = path
+    for (const [tabPort, tab] of tabs) tab.setAttribute('aria-selected', String(tabPort === port))
+    frame.src = bridge.url(port, path)
+  }
+
+  kernel.events.subscribe((event) => {
+    if (event.type === 'net.listen') {
+      let tab = tabs.get(event.port)
+      if (!tab) {
+        tab = Object.assign(document.createElement('button'), { type: 'button', textContent: `:${event.port}` })
+        tab.setAttribute('role', 'tab')
+        tab.addEventListener('click', () => show(event.port))
+        tabs.set(event.port, tab)
+        portTabs.append(tab)
+      }
+      tab.dataset.state = 'open'
+      const currentOpen = current !== undefined && tabs.get(current)?.dataset.state === 'open' && current !== event.port
+      if (!currentOpen) show(event.port, current === event.port ? addressPath.value : '/')
+    } else if (event.type === 'net.close') {
+      const tab = tabs.get(event.port)
+      if (tab) tab.dataset.state = 'closed'
+    }
+  })
+
+  // The preview's client script reports navigations inside the frame.
+  window.addEventListener('message', (event) => {
+    if (event.data?.type !== 'webcore:location' || event.source !== frame.contentWindow) return
+    const port = previewPortOf(new URL(event.origin).hostname)
+    if (port === undefined || port !== current || bridge.origin(port) !== event.origin) return
+    const url = new URL(event.data.href)
+    addressPath.value = url.pathname + url.search + url.hash
+  })
+  $<HTMLFormElement>('address').addEventListener('submit', (event) => {
+    event.preventDefault()
+    const path = addressPath.value.startsWith('/') ? addressPath.value : `/${addressPath.value}`
+    if (current !== undefined) show(current, path)
+  })
+  $<HTMLButtonElement>('reload').addEventListener('click', () => {
+    if (current !== undefined) show(current, addressPath.value || '/')
+  })
 }
 
 async function run(kernel: Kernel, line: string, echo = true): Promise<number> {
@@ -168,6 +299,7 @@ async function boot(): Promise<void> {
   kernel.addAsset('node-lib', nodeLib)
   installRootfs(kernel, binaries)
   kernel.events.subscribe(logEvent)
+  setupPreview(kernel)
 
   const examples = $<HTMLDivElement>('examples')
   for (const example of EXAMPLES) {
