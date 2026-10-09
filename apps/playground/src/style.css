@@ -1,0 +1,256 @@
+:root {
+  --bg: #0d1016;
+  --panel: #131821;
+  --panel-2: #1a202b;
+  --line: #252d3a;
+  --text: #d7dde8;
+  --muted: #7d8799;
+  --accent: #7cc4ff;
+  --ok: #7ee0a1;
+  --err: #ff8a8a;
+  --warn: #ffd27c;
+  --mono: ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 var(--sans);
+}
+
+.top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--line);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.logo {
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+  background: linear-gradient(135deg, var(--accent), var(--ok));
+  transform: rotate(45deg);
+}
+
+.name {
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.tag {
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.status {
+  font: 12px var(--mono);
+  color: var(--muted);
+}
+
+.status::before {
+  content: '';
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+  vertical-align: 1px;
+}
+
+.status[data-state='ready']::before {
+  background: var(--ok);
+}
+
+.status[data-state='busy']::before {
+  background: var(--warn);
+}
+
+.status[data-state='error'] {
+  color: var(--err);
+}
+
+.status[data-state='error']::before {
+  background: var(--err);
+}
+
+.layout {
+  flex: 1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 340px;
+  min-height: 0;
+}
+
+.terminal {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--panel);
+}
+
+.output {
+  flex: 1;
+  overflow: auto;
+  padding: 18px 20px 8px;
+  font: 13px/1.55 var(--mono);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.output .cmd {
+  color: var(--accent);
+}
+
+.output .err {
+  color: var(--err);
+}
+
+.output .meta {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.prompt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 20px 16px;
+  font: 13px var(--mono);
+}
+
+.ps1 {
+  color: var(--ok);
+  white-space: nowrap;
+}
+
+.prompt input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  caret-color: var(--accent);
+}
+
+.side {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  min-height: 0;
+  padding: 18px;
+  border-left: 1px solid var(--line);
+  background: var(--bg);
+}
+
+.side h2 {
+  margin: 0 0 10px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.count {
+  margin-left: 4px;
+  color: var(--text);
+}
+
+.examples {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.examples button {
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  font: 13px var(--sans);
+  text-align: left;
+  cursor: pointer;
+}
+
+.examples button:hover {
+  border-color: var(--accent);
+}
+
+.events-panel {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+.events {
+  flex: 1;
+  overflow: auto;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font: 11.5px/1.7 var(--mono);
+  color: var(--muted);
+}
+
+.events li {
+  overflow: hidden;
+  white-space: pre;
+  text-overflow: ellipsis;
+}
+
+.events li[data-type='process.spawn'] {
+  color: var(--accent);
+}
+
+.events li[data-type='process.exit'] {
+  color: var(--ok);
+}
+
+@media (max-width: 760px) {
+  .layout {
+    grid-template-columns: 1fr;
+    grid-template-rows: minmax(0, 1fr) 260px;
+  }
+
+  .side {
+    border-left: 0;
+    border-top: 1px solid var(--line);
+  }
+
+  .top,
+  .output,
+  .prompt {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "name": "@webcore/kernel",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Browser OS kernel: processes, file descriptors, pipes, VFS, and the syscall ABI shared by all personalities.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./web": "./src/host/web.ts",
+    "./node": "./src/host/node.ts"
+  },
+  "scripts": {
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@webcore/wat-bin": "workspace:*",
+    "vitest": "^5.0.3"
+  }
+}

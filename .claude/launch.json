@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "playground",
+      "runtimeExecutable": "pnpm",
+      "runtimeArgs": ["--filter", "@webcore/playground", "dev"],
+      "port": 5180
+    },
+    {
+      "name": "playground-build",
+      "runtimeExecutable": "pnpm",
+      "runtimeArgs": ["--filter", "@webcore/playground", "preview", "--port", "5181"],
+      "port": 5181
+    }
+  ]
+}

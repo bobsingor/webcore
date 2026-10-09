@@ -1,0 +1,19 @@
+{
+  "name": "webcore",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.34.0",
+  "engines": {
+    "node": ">=22.6"
+  },
+  "scripts": {
+    "build:wasm": "pnpm --filter @webcore/wat-bin build",
+    "dev": "pnpm build:wasm && pnpm --filter @webcore/playground dev",
+    "test": "pnpm build:wasm && pnpm --filter @webcore/kernel test",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.0",
+    "typescript": "^7.0.2"
+  }
+}

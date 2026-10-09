@@ -1,0 +1,80 @@
+import { kerr } from '../abi/errno.ts'
+import type { OpenFile } from './files.ts'
+
+const MAX_FDS = 1024
+
+/** Minimal Worker surface the kernel needs; implemented by each ProcessHost. */
+export interface WorkerLike {
+  postMessage(message: unknown, transfer: Transferable[]): void
+  terminate(): void
+}
+
+export type ProcessState = 'starting' | 'running' | 'exited'
+
+export class Process {
+  readonly pid: number
+  readonly ppid: number
+  readonly argv: string[]
+  readonly env: Record<string, string>
+  cwd: string
+  state: ProcessState = 'starting'
+  exitCode: number | null = null
+  /** Resolves with the exit code. */
+  readonly exited: Promise<number>
+  /** Aborted on exit; cancels the process's pending blocking operations. */
+  readonly abort = new AbortController()
+  readonly fds: (OpenFile | undefined)[] = []
+  worker?: WorkerLike
+  port?: MessagePort
+  page?: SharedArrayBuffer
+  private resolveExit!: (code: number) => void
+
+  constructor(init: { pid: number; ppid: number; argv: string[]; env: Record<string, string>; cwd: string }) {
+    this.pid = init.pid
+    this.ppid = init.ppid
+    this.argv = init.argv
+    this.env = init.env
+    this.cwd = init.cwd
+    this.exited = new Promise((resolve) => (this.resolveExit = resolve))
+  }
+
+  get alive(): boolean {
+    return this.state !== 'exited'
+  }
+
+  /** Installs `file` at the lowest free fd. Takes ownership of one reference. */
+  allocFd(file: OpenFile, min = 0): number {
+    for (let fd = min; fd < MAX_FDS; fd++) {
+      if (!this.fds[fd]) {
+        this.fds[fd] = file
+        return fd
+      }
+    }
+    file.release()
+    throw kerr('EMFILE')
+  }
+
+  getFd(fd: number): OpenFile {
+    const file = Number.isInteger(fd) && fd >= 0 ? this.fds[fd] : undefined
+    if (!file) throw kerr('EBADF', `fd ${fd}`)
+    return file
+  }
+
+  closeFd(fd: number): void {
+    const file = this.getFd(fd)
+    this.fds[fd] = undefined
+    file.release()
+  }
+
+  closeAll(): void {
+    for (const file of this.fds) file?.release()
+    this.fds.length = 0
+  }
+
+  markExited(code: number): void {
+    this.state = 'exited'
+    this.exitCode = code
+    this.abort.abort()
+    this.resolveExit(code)
+  }
+}

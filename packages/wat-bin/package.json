@@ -1,0 +1,17 @@
+{
+  "name": "@webcore/wat-bin",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Tiny hand-written WASI preview1 programs (echo, cat, wc, ls) for testing the WASI personality without a C toolchain.",
+  "type": "module",
+  "exports": {
+    "./*.wasm": "./dist/*.wasm",
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs"
+  },
+  "devDependencies": {
+    "wabt": "^1.0.39"
+  }
+}
