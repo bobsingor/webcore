@@ -8,6 +8,7 @@
 import type { SocketAddress, SocketInfo } from '../../../abi/syscalls.ts'
 import { familyOf, isLocalAddress } from '../../../kernel/net.ts'
 import { bytesOf, encode } from '../codec.ts'
+import { host } from '../host.ts'
 import type { Realm } from '../realm.ts'
 import { SysError } from '../../../process/syscalls.ts'
 import { uvCode } from '../uv.ts'
@@ -523,7 +524,35 @@ export function createStreams(realm: Realm) {
 
 export type Streams = ReturnType<typeof createStreams>
 
-const streamsOf = (realm: Realm): Streams => (realm.streams ??= createStreams(realm))
+/** An IPv6 address as 16 bytes (uv_inet_pton), or undefined if it isn't one. */
+function ipv6Bytes(address: string): Uint8Array | undefined {
+  let text = address.split('%')[0]
+  const bytes = new Uint8Array(16)
+  // An embedded IPv4 address (::ffff:1.2.3.4) is the last two groups.
+  const v4 = /(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(text)
+  if (v4) {
+    const octets = v4.slice(1).map(Number)
+    if (octets.some((octet) => octet > 255)) return undefined
+    text = `${text.slice(0, v4.index)}${((octets[0] << 8) | octets[1]).toString(16)}:${((octets[2] << 8) | octets[3]).toString(16)}`
+  }
+  const halves = text.split('::')
+  if (halves.length > 2) return undefined
+  const groups = (part: string) => (part ? part.split(':') : [])
+  const head = groups(halves[0])
+  const tail = halves.length === 2 ? groups(halves[1]) : []
+  const missing = 8 - head.length - tail.length
+  if (halves.length === 1 ? missing !== 0 : missing < 1) return undefined
+  const all = [...head, ...Array(halves.length === 2 ? missing : 0).fill('0'), ...tail]
+  for (const [i, group] of all.entries()) {
+    if (!/^[0-9a-fA-F]{1,4}$/.test(group)) return undefined
+    const value = Number.parseInt(group, 16)
+    bytes[i * 2] = value >> 8
+    bytes[i * 2 + 1] = value & 0xff
+  }
+  return bytes
+}
+
+export const streamsOf = (realm: Realm): Streams => (realm.streams ??= createStreams(realm))
 
 export function streamBindings() {
   return {
@@ -563,12 +592,59 @@ export function streamBindings() {
       Process: streamsOf(realm).Process,
       constants: { kProcessFlagDetached: 1, kProcessFlagWindowsHide: 2, kProcessFlagWindowsVerbatimArguments: 4 },
     }),
-    // fs.watch arrives with kernel file events (M1e); watchers need the class to load.
+    // fs.watch over the kernel's watch fds (like inotify): one async read per batch of changes.
     fs_event_wrap: (realm: Realm) => {
+      const { sys, loop } = realm
+      const decoder = new host.TextDecoder()
       class FSEvent extends streamsOf(realm).HandleWrap {
-        initialized = false
-        start() {
-          return UV_ENOSYS
+        onchange?: (status: number, eventType: string, filename: unknown) => void
+        #fd = -1
+
+        get initialized() {
+          return this.#fd >= 0
+        }
+
+        start(filename: string, persistent: boolean, recursive: boolean, encoding?: string) {
+          try {
+            this.#fd = sys.call('watch', filename, Boolean(recursive))
+          } catch (error) {
+            if (!(error instanceof SysError)) throw error
+            return uvCode(error)
+          }
+          if (!persistent) this.unref()
+          this.setActive(true)
+          void this.pump(encoding)
+          return 0
+        }
+
+        protected override onClose(): void {
+          const fd = this.#fd
+          this.#fd = -1
+          if (fd >= 0) {
+            try {
+              sys.call('close', fd)
+            } catch {
+              // The process is exiting.
+            }
+          }
+        }
+
+        private async pump(encoding?: string): Promise<void> {
+          while (this.#fd >= 0) {
+            let chunk: Uint8Array
+            try {
+              chunk = await sys.callAsync('read', this.#fd, READ_CHUNK)
+            } catch {
+              return
+            }
+            if (!chunk.length || this.#fd < 0) return
+            for (const line of decoder.decode(chunk).split('\n')) {
+              if (!line) continue
+              const { event, path } = JSON.parse(line) as { event: string; path: string }
+              const name = encoding === 'buffer' ? realm.newBuffer(encode(path, 'utf8')) : path
+              loop.callback(() => this.onchange?.call(this, 0, event, name))
+            }
+          }
         }
       }
       return { FSEvent }
@@ -641,7 +717,10 @@ export function streamBindings() {
         getnameinfo: (req: object, host: string, port: number) =>
           isLocalAddress(host) ? complete(req, 0, 'localhost', String(port)) : complete(req, UV_EAI_NONAME),
         canonicalizeIP: (ip: string) => (familyOf(ip) ? ip.toLowerCase() : undefined),
-        convertIpv6StringToBuffer: () => null,
+        convertIpv6StringToBuffer: (address: string) => {
+          const bytes = ipv6Bytes(address)
+          return bytes ? realm.newBuffer(bytes) : null
+        },
         strerror: (code: number) => (code === UV_EAI_NONAME ? 'unknown node or service' : `DNS error ${code}`),
         AI_ADDRCONFIG: 1024,
         AI_ALL: 256,

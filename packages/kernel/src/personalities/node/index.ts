@@ -5,6 +5,7 @@ import type { Platform } from '../../process/main.ts'
 import type { SyscallClient } from '../../process/syscalls.ts'
 import { parseCommandLine } from './cli.ts'
 import { NodeLib } from './lib.ts'
+import { endThread } from './bindings/worker.ts'
 import { Realm } from './realm.ts'
 import { host } from './host.ts'
 
@@ -18,7 +19,10 @@ export function runNodejs(boot: BootMessage, sys: SyscallClient, platform: Platf
   if (!asset) throw new Error('the Node standard library (node-lib asset) is not installed')
 
   const lib = new NodeLib(asset)
-  const commandLine = parseCommandLine(lib, boot.argv, boot.execPath, boot.env)
+  // A worker_threads thread has no script on its command line: just argv0 and its execArgv.
+  const threadOptions = boot.thread?.options as { argv0?: string; execArgv?: string[] } | undefined
+  const argv = threadOptions ? [threadOptions.argv0 ?? boot.argv[0], ...(threadOptions.execArgv ?? [])] : boot.argv
+  const commandLine = parseCommandLine(lib, argv, boot.execPath, boot.env)
   if (commandLine.error) {
     stderr(`${boot.argv[0]}: ${commandLine.error}\n`)
     sys.exit(kInvalidCommandLineArgument)
@@ -29,7 +33,10 @@ export function runNodejs(boot: BootMessage, sys: SyscallClient, platform: Platf
   }
 
   const realm = new Realm({ boot, sys, platform, lib, commandLine })
-  if (boot.env.WEBCORE_TRACE_BINDINGS) realm.loop.onExit = () => stderr(realm.trace.report())
+  realm.loop.onExit = (code) => {
+    if (boot.thread) endThread(realm, code)
+    if (boot.env.WEBCORE_TRACE_BINDINGS) stderr(realm.trace.report())
+  }
   platform.onUncaughtError((error) => realm.loop.uncaught(error, false))
 
   try {

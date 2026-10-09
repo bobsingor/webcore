@@ -1,6 +1,6 @@
 # 0006. Native addons via Wasm N-API plus install-time substitution
 
-- **Status:** Accepted · wasm32-wasi substitution for napi-rs packages in M1d ([0015](0015-own-npm-and-userland.md))
+- **Status:** Accepted · wasm32-wasi substitution for napi-rs packages in M1d ([0015](0015-own-npm-and-userland.md)), wasm32-wasi addons run in M1e ([0016](0016-threads-and-worker-threads.md))
 - **Date:** 2026-10-09
 
 ## Context

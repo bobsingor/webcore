@@ -126,6 +126,9 @@ export class Realm {
    */
   readonly hostGlobals: Record<string, unknown>
 
+  /** Process-wide worker_threads ids, shared by every thread (Atomics.add). */
+  readonly threadIdCounter: Int32Array
+
   private readonly factories: Record<string, BindingFactory>
   private readonly bindingCache = new Map<string, object>()
 
@@ -140,6 +143,9 @@ export class Realm {
     for (const name of PER_ISOLATE_SYMBOLS) this.perIsolateSymbols[name] = Symbol(name)
     this.factories = createBindings()
     this.hostGlobals = captureHostGlobals(this.loop)
+    hideHostOnlyGlobals()
+    this.threadIdCounter =
+      (init.boot.thread?.options.threadIdCounter as Int32Array | undefined) ?? new Int32Array(new SharedArrayBuffer(4))
     this.process = this.createProcessObject()
     this.loop.process = this.process
   }
@@ -153,6 +159,17 @@ export class Realm {
       this.bindingCache.set(name, binding)
     }
     return binding
+  }
+
+  /** Whether `arg` is a Node option (for worker execArgv validation). V8 flags are accepted too. */
+  isKnownOption(arg: string): boolean {
+    const name = arg.split('=')[0]
+    return name in this.lib.options || /^--(max-old-space-size|max-semi-space-size|stack-size|expose-gc|harmony|jitless|no-)/.test(name)
+  }
+
+  /** process.env is a Proxy, which structured clone can't copy (messaging sends a plain copy). */
+  isEnvProxy(value: unknown): boolean {
+    return typeof value === 'object' && value !== null && envProxies.has(value)
   }
 
   /** Node's bundled acorn, used to compile ES modules and to find import() in scripts. */
@@ -217,8 +234,9 @@ export class Realm {
       'internal/bootstrap/node',
       'internal/bootstrap/web/exposed-wildcard',
       'internal/bootstrap/web/exposed-window-or-worker',
-      'internal/bootstrap/switches/is_main_thread',
-      'internal/bootstrap/switches/does_own_process_state',
+      ...(this.boot.thread
+        ? ['internal/bootstrap/switches/is_not_main_thread', 'internal/bootstrap/switches/does_not_own_process_state']
+        : ['internal/bootstrap/switches/is_main_thread', 'internal/bootstrap/switches/does_own_process_state']),
     ]) {
       this.compile(id)(this.process, this.requireBuiltin, this.internalBinding, primordials)
     }
@@ -238,7 +256,8 @@ export class Realm {
 
   /** StartExecution: runs one internal/main/* script inside a callback scope. */
   runMain(): void {
-    const id = selectMainScript(this.commandLine)
+    // A worker_threads thread waits for its script on the env port (internal/main/worker_thread).
+    const id = this.boot.thread ? 'internal/main/worker_thread' : selectMainScript(this.commandLine)
     this.loop.callback(() => this.compile(id)(this.process, this.requireBuiltin, this.internalBinding, this.primordials))
     this.loop.queueAliveCheck()
   }
@@ -276,6 +295,55 @@ export class Realm {
   }
 }
 
+// Globals a Node process has (Node 24's own, plus ECMAScript's). Everything else a Worker offers
+// (self, importScripts, postMessage, XMLHttpRequest, addEventListener, location, …) is hidden:
+// code that sees them concludes it runs in a browser, and picks browser code paths.
+const NODE_GLOBALS = new Set(
+  (
+    'AbortController AbortSignal AggregateError Array ArrayBuffer AsyncDisposableStack Atomics BigInt BigInt64Array ' +
+    'BigUint64Array Blob Boolean BroadcastChannel Buffer ByteLengthQueuingStrategy CloseEvent CompressionStream ' +
+    'CountQueuingStrategy Crypto CryptoKey CustomEvent DOMException DataView Date DecompressionStream DisposableStack ' +
+    'Error EvalError Event EventTarget File FinalizationRegistry Float16Array Float32Array Float64Array FormData ' +
+    'Function Headers Infinity Int16Array Int32Array Int8Array Intl Iterator JSON Map Math MessageChannel ' +
+    'MessageEvent MessagePort NaN Navigator Number Object Performance PerformanceEntry PerformanceMark ' +
+    'PerformanceMeasure PerformanceObserver PerformanceObserverEntryList PerformanceResourceTiming Promise Proxy ' +
+    'RangeError ReadableByteStreamController ReadableStream ReadableStreamBYOBReader ReadableStreamBYOBRequest ' +
+    'ReadableStreamDefaultController ReadableStreamDefaultReader ReferenceError Reflect RegExp Request Response Set ' +
+    'SharedArrayBuffer String SubtleCrypto SuppressedError Symbol SyntaxError TextDecoder TextDecoderStream ' +
+    'TextEncoder TextEncoderStream TransformStream TransformStreamDefaultController TypeError URIError URL ' +
+    'URLPattern URLSearchParams Uint16Array Uint32Array Uint8Array Uint8ClampedArray WeakMap WeakRef WeakSet ' +
+    'WebAssembly WebSocket WritableStream WritableStreamDefaultController WritableStreamDefaultWriter atob btoa ' +
+    'clearImmediate clearInterval clearTimeout console constructor crypto decodeURI decodeURIComponent encodeURI ' +
+    'encodeURIComponent escape eval fetch global globalThis isFinite isNaN navigator parseFloat parseInt ' +
+    'performance process queueMicrotask setImmediate setInterval setTimeout structuredClone undefined unescape ' +
+    'Temporal ShadowRealm'
+  ).split(' '),
+)
+
+function hideHostOnlyGlobals(): void {
+  const global = globalThis as unknown as Record<string, unknown>
+  const names = new Set<string>()
+  for (let object: object | null = globalThis; object && object !== Object.prototype; object = Object.getPrototypeOf(object)) {
+    for (const name of Object.getOwnPropertyNames(object)) names.add(name)
+  }
+  for (const name of names) {
+    if (NODE_GLOBALS.has(name) || name.startsWith('__webcore')) continue
+    try {
+      delete global[name]
+    } catch {
+      // Not configurable.
+    }
+    // Inherited (from WorkerGlobalScope or EventTarget): shadow it rather than touch shared prototypes.
+    if (name in globalThis) {
+      try {
+        Object.defineProperty(globalThis, name, { value: undefined, writable: true, configurable: true, enumerable: false })
+      } catch {
+        // Leave it.
+      }
+    }
+  }
+}
+
 /** Global used by import() in scripts and CommonJS (see Realm.importCallFor). */
 const IMPORT_DISPATCHER = '__webcore_import'
 
@@ -308,6 +376,8 @@ function captureHostGlobals(loop: UvLoop): Record<string, unknown> {
   trackMethods((globals.Response as { prototype?: object } | undefined)?.prototype, BODY_METHODS)
   trackMethods((globals.Request as { prototype?: object } | undefined)?.prototype, BODY_METHODS)
   trackMethods((host.ReadableStreamDefaultReader as { prototype?: object } | undefined)?.prototype, ['read'])
+  // V8 compiles on background threads and Node's platform keeps the loop alive meanwhile.
+  trackMethods(host.WebAssembly as object | undefined, ['compile', 'instantiate', 'compileStreaming', 'instantiateStreaming'])
   return globals
 }
 
@@ -346,10 +416,12 @@ function hideHostFrames(): void {
 }
 
 /** process.env (src/node_env_var.cc): values are coerced to strings; symbols are rejected. */
+const envProxies = new WeakSet<object>()
+
 function createEnvProxy(initial: Record<string, string>): Record<string, string> {
   const store: Record<string, string> = Object.create(null)
   Object.assign(store, initial)
-  return new Proxy(store, {
+  const proxy = new Proxy(store, {
     set(target, key, value) {
       if (typeof key === 'symbol') throw new TypeError('Cannot convert a Symbol value to a string')
       target[key] = String(value)
@@ -365,4 +437,6 @@ function createEnvProxy(initial: Record<string, string>): Record<string, string>
       return { value: target[key], writable: true, enumerable: true, configurable: true }
     },
   })
+  envProxies.add(proxy)
+  return proxy
 }

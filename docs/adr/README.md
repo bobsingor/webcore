@@ -11,13 +11,14 @@ acceptance except to change their status. A decision is reversed by a new record
 | [0003](0003-linux-semantics-and-numbering.md) | Kernel ABI follows Linux semantics, flags and errno numbering | Accepted · implemented in M0 |
 | [0004](0004-wasi-and-wasix-abi.md) | Wasm binaries use WASI preview1 + WASIX; Emscripten via an adapter | Accepted · preview1 in M0 |
 | [0005](0005-js-on-the-host-engine.md) | JavaScript runs on the host engine; Node built from Node's own `lib/` | Accepted · implemented in M1a |
-| [0006](0006-native-addons.md) | Native addons via Wasm N-API plus install-time substitution | Accepted · substitution in M1d |
+| [0006](0006-native-addons.md) | Native addons via Wasm N-API plus install-time substitution | Accepted · substitution in M1d, wasm32-wasi addons in M1e |
 | [0007](0007-content-addressed-cow-vfs.md) | Content-addressed, copy-on-write VFS; snapshots are tree hashes | Accepted |
 | [0008](0008-virtual-networking.md) | Virtual sockets in the kernel; Service Worker preview; optional TCP relay | Accepted · loopback and previews in M1c |
-| [0009](0009-origin-isolation.md) | Runtime and previews live on their own origins | Accepted · preview origins in M1c |
+| [0009](0009-origin-isolation.md) | Runtime and previews live on their own origins | Accepted · preview origins in M1c; runtime iframe in M1f |
 | [0010](0010-structured-event-log.md) | Every kernel action emits a structured event | Accepted · basic events in M0 |
 | [0011](0011-environment-agnostic-core.md) | Kernel core is environment-agnostic (browser and headless) | Accepted · implemented in M0 |
 | [0012](0012-vendored-node-lib.md) | Vendor Node's `lib/` at a pinned LTS; ship it as one shared-memory bundle | Accepted · implemented in M1a |
 | [0013](0013-esm-generator-transform.md) | ES modules run as two-phase generators compiled from source | Accepted · implemented in M1b |
 | [0014](0014-preview-bridge.md) | Loopback TCP, and previews served through a Service Worker bridge | Accepted · implemented in M1c |
 | [0015](0015-own-npm-and-userland.md) | npm and sh are webcore programs; the kernel unpacks packages | Accepted · implemented in M1d |
+| [0016](0016-threads-and-worker-threads.md) | Threads are Workers inside a process; worker_threads runs on host MessagePorts | Accepted · implemented in M1e |

@@ -13,8 +13,11 @@ import { bytesOf, decode, encode } from '../codec.ts'
 import type { Realm } from '../realm.ts'
 import { uvCode, uvException } from '../uv.ts'
 import { host } from '../host.ts'
+import { streamsOf } from './streams.ts'
 
 const kFsStatsFieldsNumber = 18
+// What fs.watchFile reports for a path that doesn't exist: all zeros.
+const EMPTY_STAT: Stat = { type: 'file', mode: 0, ino: 0, nlink: 0, size: 0, atimeMs: 0, mtimeMs: 0, ctimeMs: 0, birthtimeMs: 0 }
 const UV_DIRENT: Record<FileType, number> = { file: 1, dir: 2, symlink: 3, fifo: 4, socket: 5, chardev: 6 }
 const COPYFILE_EXCL = 1
 
@@ -220,13 +223,49 @@ export function fsBindings() {
         bigintStatFsValues: new BigInt64Array(8),
         FSReqCallback,
         FileHandle,
-        StatWatcher: class StatWatcher {
-          start() {
+        // fs.watchFile: polls stat(), like uv_fs_poll, and reports [new stats, old stats].
+        StatWatcher: class StatWatcher extends streamsOf(realm).HandleWrap {
+          onchange?: (status: number, stats: Float64Array | BigInt64Array) => void
+          readonly #bigint: boolean
+          #timer?: ReturnType<typeof setTimeout>
+          #previous?: Float64Array | BigInt64Array
+
+          constructor(bigint: boolean) {
+            super()
+            this.#bigint = Boolean(bigint)
+          }
+
+          start(path: string, interval: number) {
+            const sample = () => {
+              try {
+                return { status: 0, values: statValues(stat(path), this.#bigint) }
+              } catch (error) {
+                return { status: error instanceof SysError ? -error.errno : -5, values: statValues(EMPTY_STAT, this.#bigint) }
+              }
+            }
+            let current = sample()
+            this.#previous = current.values
+            const poll = () => {
+              const next = sample()
+              const changed = next.status !== current.status || next.values.some((value, i) => value !== this.#previous![i])
+              if (changed) {
+                const both = this.#bigint ? new BigInt64Array(2 * kFsStatsFieldsNumber) : new Float64Array(2 * kFsStatsFieldsNumber)
+                both.set(next.values as never, 0)
+                both.set(this.#previous as never, kFsStatsFieldsNumber)
+                this.#previous = next.values
+                current = next
+                loop.callback(() => this.onchange?.call(this, next.status, both))
+              }
+              if (!this.closed) this.#timer = host.setTimeout(poll, interval)
+            }
+            this.#timer = host.setTimeout(poll, interval)
+            this.setActive(true)
             return 0
           }
-          close() {}
-          ref() {}
-          unref() {}
+
+          protected override onClose(): void {
+            if (this.#timer !== undefined) host.clearTimeout(this.#timer)
+          }
         },
 
         access: (path: unknown, _mode: number, req?: Request) =>

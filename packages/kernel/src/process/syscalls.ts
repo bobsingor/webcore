@@ -49,10 +49,15 @@ export class SyscallClient {
   }
 
   callAsync<N extends SyscallName>(name: N, ...args: SyscallArgs<N>): Promise<SyscallReturn<N>> {
+    return this.callAsyncTransfer(name, args, [])
+  }
+
+  /** callAsync whose arguments include transferables (MessagePorts). */
+  callAsyncTransfer<N extends SyscallName>(name: N, args: SyscallArgs<N>, transfer: Transferable[]): Promise<SyscallReturn<N>> {
     const id = this.nextId++
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve: resolve as (value: unknown) => void, reject })
-      this.post({ t: 'sys', id, name, args, sync: false })
+      this.post({ t: 'sys', id, name, args, sync: false }, transfer)
     })
   }
 
@@ -63,8 +68,8 @@ export class SyscallClient {
     return park(this.page)
   }
 
-  private post(request: SyscallRequest): void {
-    this.port.postMessage(request)
+  private post(request: SyscallRequest, transfer: Transferable[] = []): void {
+    this.port.postMessage(request, transfer)
   }
 
   private onReply(reply: SyscallReply): void {

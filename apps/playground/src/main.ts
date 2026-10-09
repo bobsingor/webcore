@@ -69,6 +69,23 @@ interface Example {
   command: string
   /** Host-side setup before the command runs. */
   prepare?: (kernel: Kernel) => Promise<void>
+  /** Instead of a command: a host-side action that also works while a command runs. */
+  action?: (kernel: Kernel) => string
+}
+
+const APP_JSX = '/home/user/my-app/src/App.jsx'
+
+/** What an editor does: rewrites a file through the kernel, which tells its watchers. */
+function editApp(kernel: Kernel): string {
+  let source: string
+  try {
+    source = new TextDecoder().decode(kernel.fs.readFile(APP_JSX))
+  } catch {
+    return `${APP_JSX} doesn't exist yet: run "npm create vite (React)" first.\n`
+  }
+  const heading = `Edited at ${new Date().toLocaleTimeString()}`
+  kernel.writeFile(APP_JSX, source.replace(/<h1>[^<]*<\/h1>/, `<h1>${heading}</h1>`))
+  return `Wrote "${heading}" into ${APP_JSX}. With "npm run dev" running, the preview updates in place (HMR).\n`
 }
 
 const EXAMPLES: Example[] = [
@@ -111,11 +128,24 @@ const EXAMPLES: Example[] = [
   },
   {
     label: 'npm create vite (React)',
-    command: 'npm create vite@latest my-app -- --template react',
+    command: 'cd /home/user && npm create vite@latest my-app -- --template react',
   },
   {
     label: 'npm install',
-    command: 'cd my-app && npm install',
+    command: 'cd /home/user/my-app && npm install',
+  },
+  {
+    label: 'npm run dev (Vite)',
+    command: 'cd /home/user/my-app && npm run dev',
+  },
+  {
+    label: 'Edit App.jsx (HMR)',
+    command: '',
+    action: editApp,
+  },
+  {
+    label: 'worker_threads',
+    command: `node -e "const { Worker } = require('worker_threads'); const body = () => { const t = require('worker_threads'); t.parentPort.postMessage('hello from thread ' + t.threadId) }; new Worker('(' + body + ')()', { eval: true }).on('message', console.log)"`,
   },
 ]
 
@@ -294,8 +324,12 @@ async function boot(): Promise<void> {
   const examples = $<HTMLDivElement>('examples')
   for (const example of EXAMPLES) {
     const button = Object.assign(document.createElement('button'), { type: 'button', textContent: example.label })
-    button.title = example.command
+    button.title = example.command || example.label
     button.addEventListener('click', async () => {
+      if (example.action) {
+        print(example.action(kernel), 'meta')
+        return
+      }
       if (running) return
       await example.prepare?.(kernel)
       input.value = example.command

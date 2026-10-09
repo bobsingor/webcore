@@ -16,12 +16,13 @@ import { SPAWN_SYNC_HEADER_BYTES } from '../abi/syscalls.ts'
 import type { SocketInfo, SpawnSyncRequest, SyscallArgs, SyscallName, SyscallReturn, SyscallValue } from '../abi/syscalls.ts'
 import { EventBus } from './events.ts'
 import { extractArchive, type ExtractOptions } from './extract.ts'
+import { Watcher } from './watch.ts'
 import { Listener, Network, Socket } from './net.ts'
 import { resolveExecutable, type Executable } from './exec.ts'
 import { DeviceHandle, DirHandle, FileHandle, PipeReader, PipeWriter, type OpenFile } from './files.ts'
 import { dirname, normalize, resolve } from './path.ts'
 import { Pipe } from './pipe.ts'
-import { Process, type WorkerLike } from './process.ts'
+import { Process, type Channel, type Thread, type WorkerLike } from './process.ts'
 import { MemFS, type FileNode } from './vfs.ts'
 
 /** Environment-specific process startup (ADR-0011). */
@@ -73,12 +74,20 @@ export class Kernel {
   private readonly procs = new Map<number, Process>()
   private readonly modules = new WeakMap<FileNode, { version: number; module: Promise<WebAssembly.Module> }>()
   private readonly assets: Record<string, Uint8Array> = {}
+  private readonly watchers = new Set<Watcher>()
   private nextPid = 1
 
   constructor(options: KernelOptions) {
     this.host = options.host
     this.pageBytes = options.pageBytes ?? DEFAULT_PAGE_BYTES
     for (const [name, bytes] of Object.entries(options.assets ?? {})) this.addAsset(name, bytes)
+    this.events.subscribe((event) => {
+      if (event.type !== 'fs.change' || !this.watchers.size) return
+      for (const watcher of this.watchers) {
+        watcher.notify(event.op, event.path)
+        if (event.to) watcher.notify(event.op, event.to)
+      }
+    })
   }
 
   /**
@@ -148,6 +157,17 @@ export class Kernel {
     return files
   }
 
+  /**
+   * Writes a file from outside any process (an editor), reporting the change like a process write
+   * would, so watchers (fs.watch, Vite's HMR) see it.
+   */
+  writeFile(path: string, content: Uint8Array | string): void {
+    const target = normalize(path)
+    const existed = this.fs.tryLookup(target) !== undefined
+    this.fs.writeFile(target, content)
+    this.events.emit({ type: 'fs.change', op: existed ? 'write' : 'create', path: target })
+  }
+
   getProcess(pid: number): Process | undefined {
     return this.procs.get(pid)
   }
@@ -181,12 +201,10 @@ export class Kernel {
     try {
       const module = exe.personality === 'wasi' ? await this.compile(exe.node) : undefined
       if (proc.state === 'exited') return
-      const page = createPage(this.pageBytes)
-      const { port1, port2 } = new MessageChannel()
-      proc.page = page
-      proc.port = port1
-      port1.addEventListener('message', (event) => void this.dispatch(proc, event.data))
-      port1.start()
+      const { channel, port } = this.openChannel(proc)
+      proc.page = channel.page
+      proc.port = channel.port
+      proc.execPath = exe.path
       proc.worker = this.host.createWorker((error) => this.crash(proc, error))
       const boot: BootMessage = {
         pid: proc.pid,
@@ -198,14 +216,69 @@ export class Kernel {
         personality: exe.personality,
         module,
         assets: this.assets,
-        page,
-        port: port2,
+        page: channel.page,
+        port,
       }
-      proc.worker.postMessage(boot, [port2])
+      proc.worker.postMessage(boot, [port])
       proc.state = 'running'
     } catch (error) {
       this.crash(proc, error)
     }
+  }
+
+  /** A syscall channel: a page for sync calls and a port for everything else (ADR-0002). */
+  private openChannel(proc: Process, thread?: Thread): { channel: Channel; port: MessagePort } {
+    const { port1, port2 } = new MessageChannel()
+    const channel: Channel = { page: createPage(this.pageBytes), port: port1, thread }
+    port1.addEventListener('message', (event) => void this.dispatch(proc, event.data, channel))
+    port1.start()
+    return { channel, port: port2 }
+  }
+
+  /** Starts a worker_threads thread: a new Worker in an existing process. */
+  private spawnThread(proc: Process, env: Record<string, string>, options: Record<string, unknown>, threadPort: MessagePort, id?: number): number {
+    let resolve!: (code: number) => void
+    const thread: Thread = {
+      id: id ?? proc.nextThreadId++,
+      alive: true,
+      exited: new Promise((done) => (resolve = done)),
+      resolve: (code) => resolve(code),
+    }
+    const { channel, port } = this.openChannel(proc, thread)
+    thread.channel = channel
+    proc.threads.set(thread.id, thread)
+    thread.worker = this.host.createWorker((error) => {
+      console.error(`[kernel] thread ${thread.id} of pid ${proc.pid} failed`, error)
+      this.endThread(proc, thread, 1)
+    })
+    const boot: BootMessage = {
+      pid: proc.pid,
+      ppid: proc.ppid,
+      argv: proc.argv,
+      env,
+      cwd: proc.cwd,
+      execPath: proc.execPath,
+      personality: 'node',
+      assets: this.assets,
+      page: channel.page,
+      port,
+      thread: { id: thread.id, port: threadPort, options },
+    }
+    thread.worker.postMessage(boot, [port, threadPort])
+    return thread.id
+  }
+
+  private endThread(proc: Process, thread: Thread, code: number): void {
+    if (!thread.alive) return
+    thread.alive = false
+    thread.channel?.port.close()
+    try {
+      thread.worker?.terminate()
+    } catch {
+      // Already gone.
+    }
+    // Unlike a process's, a thread's exit code is a full integer (Node reports it as is).
+    thread.resolve(code)
   }
 
   private compile(node: FileNode): Promise<WebAssembly.Module> {
@@ -240,6 +313,7 @@ export class Kernel {
     } catch {
       // Already gone.
     }
+    for (const thread of [...proc.threads.values()]) this.endThread(proc, thread, code)
     this.events.emit({ type: 'process.exit', pid: proc.pid, code: proc.exitCode! })
 
     // Host-spawned processes and orphans are reaped now; children stay zombies until their parent
@@ -254,10 +328,12 @@ export class Kernel {
   // ---------------------------------------------------------------------------------------------
   // Syscalls
 
-  private async dispatch(proc: Process, request: SyscallRequest): Promise<void> {
+  private async dispatch(proc: Process, request: SyscallRequest, channel: Channel): Promise<void> {
     if (request?.t !== 'sys' || proc.state === 'exited') return
     if (request.name === 'exit') {
-      this.terminate(proc, Number(request.args[0]) | 0)
+      // exit from a thread ends the thread (process.exit() in a worker); from the main thread, the process.
+      if (channel.thread) this.endThread(proc, channel.thread, Number(request.args[0]) | 0)
+      else this.terminate(proc, Number(request.args[0]) | 0)
       return
     }
     let errno = 0
@@ -274,13 +350,13 @@ export class Kernel {
         console.error(`[kernel] ${request.name} failed`, error)
       }
     }
-    // The process may have been killed while the syscall was pending.
-    if (!proc.alive) return
+    // The process (or thread) may have ended while the syscall was pending.
+    if (!proc.alive || (channel.thread && !channel.thread.alive)) return
     if (request.sync) {
-      completeSync(proc.page!, errno, value)
+      completeSync(channel.page, errno, value)
     } else {
       const reply: SyscallReply = { t: 'ret', id: request.id, errno, value }
-      proc.port!.postMessage(reply)
+      channel.port.postMessage(reply)
     }
   }
 
@@ -436,6 +512,33 @@ export class Kernel {
     extract: (proc, archive, dir, options = {}) => {
       if (!(archive instanceof Uint8Array)) throw kerr('EINVAL')
       return this.extract(archive, this.resolveAt(proc, AT_FDCWD, dir), options)
+    },
+
+    watch: (proc, path, recursive) => {
+      const target = this.resolveAt(proc, AT_FDCWD, path)
+      const node = this.fs.lookup(target)
+      return proc.allocFd(new Watcher(this.watchers, target, node.kind === 'dir', Boolean(recursive)))
+    },
+
+    threadSpawn: (proc, request, port) => {
+      if (!(port instanceof MessagePort)) throw kerr('EINVAL', 'threadSpawn needs a MessagePort')
+      if (request?.id !== undefined && proc.threads.has(request.id)) throw kerr('EEXIST', `thread ${request.id}`)
+      return this.spawnThread(proc, request?.env ?? proc.env, request?.options ?? {}, port, request?.id)
+    },
+
+    threadWait: async (proc, id) => {
+      const thread = proc.threads.get(id)
+      if (!thread) throw kerr('ESRCH', `thread ${id}`)
+      const code = await thread.exited
+      proc.threads.delete(id)
+      return code
+    },
+
+    threadTerminate: (proc, id) => {
+      const thread = proc.threads.get(id)
+      if (!thread) throw kerr('ESRCH', `thread ${id}`)
+      this.endThread(proc, thread, 1)
+      return 0
     },
 
     shutdown: (proc, fd) => {

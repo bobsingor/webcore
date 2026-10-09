@@ -35,7 +35,7 @@ export class UvLoop {
   /** errors.triggerUncaughtException; installed by the errors binding. */
   onUncaught?: (error: unknown, fromPromise: boolean) => void
   /** Runs just before the process ends (diagnostics). */
-  onExit?: () => void
+  onExit?: (code: number) => void
   process?: object
 
   private readonly sys: SyscallClient
@@ -123,9 +123,16 @@ export class UvLoop {
     }
   }
 
-  /** Runs `fn` as a macrotask, inside a callback scope. Faster than setTimeout(0). */
+  /**
+   * Runs `fn` as a macrotask, inside a callback scope. Faster than setTimeout(0). Like a request
+   * in libuv, a queued callback (a completion, a close callback) keeps the loop alive until it ran.
+   */
   macrotask(fn: () => void): void {
-    this.defer(() => this.callback(fn))
+    this.requests++
+    this.defer(() => {
+      this.requests--
+      this.callback(fn)
+    })
   }
 
   /** Runs `fn` as a bare macrotask, outside any callback scope (for "native" work). */
@@ -204,11 +211,14 @@ export class UvLoop {
   private queueImmediates(): void {
     if (this.immediatesQueued || this.immediateInfo[kCount] === 0) return
     this.immediatesQueued = true
-    this.macrotask(() => {
-      this.immediatesQueued = false
-      if (this.immediateInfo[kCount] > 0) this.processImmediate?.()
-      this.queueImmediates()
-    })
+    // Not macrotask(): unreferenced immediates don't keep the loop alive.
+    this.defer(() =>
+      this.callback(() => {
+        this.immediatesQueued = false
+        if (this.immediateInfo[kCount] > 0) this.processImmediate?.()
+        this.queueImmediates()
+      }),
+    )
   }
 
   // --- exit -------------------------------------------------------------------------------------
@@ -216,16 +226,17 @@ export class UvLoop {
   queueAliveCheck(): void {
     if (this.aliveCheckQueued || this.exiting) return
     this.aliveCheckQueued = true
-    // A real timeout (not a microtask) so pending promise reactions get to schedule work first.
-    this.realSetTimeout(() => {
+    // A macrotask (not a microtask) so pending promise reactions get to schedule work first. Not
+    // setTimeout: browsers clamp nested timers, and throttle them to 1 s in background tabs.
+    this.defer(() => {
       this.aliveCheckQueued = false
       if (this.isAlive() || this.exiting) return
       this.callback(() => this.emit?.('beforeExit', this.exitCode(0)))
-      this.realSetTimeout(() => {
+      this.defer(() => {
         if (this.isAlive()) this.queueAliveCheck()
         else this.exitNaturally()
-      }, 0)
-    }, 0)
+      })
+    })
   }
 
   exitCode(fallback: number): number {
@@ -243,7 +254,7 @@ export class UvLoop {
 
   reallyExit(code: number): never {
     this.exiting = true
-    this.onExit?.()
+    this.onExit?.(code)
     return this.sys.exit(code)
   }
 

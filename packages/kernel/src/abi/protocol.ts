@@ -34,4 +34,15 @@ export interface BootMessage {
   assets: Record<string, Uint8Array>
   page: SharedArrayBuffer
   port: MessagePort
+  /** Set when this Worker is a thread of an existing process (worker_threads), not a process. */
+  thread?: ThreadBoot
+}
+
+export interface ThreadBoot {
+  /** Unique within the process; the main thread is 0. */
+  id: number
+  /** The personality's own channel to the thread's creator (Node: the worker's env message port). */
+  port: MessagePort
+  /** Personality-specific options from the creator (Node: execArgv, name, resource limits). */
+  options: Record<string, unknown>
 }

@@ -120,10 +120,8 @@ describe('bindings', () => {
       "const failed = []; for (const id of require('module').builtinModules) { try { require(id) } catch { failed.push(id) } } console.log(failed.join(' '))",
     )
     const later = [
-      // nghttp2 (not scheduled yet)
-      'http2',
-      // vm contexts; V8 serializer
-      'repl', 'node:test',
+      // vm contexts
+      'repl',
       // Like official builds without them
       'inspector', 'inspector/promises', 'trace_events',
     ]

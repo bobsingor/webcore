@@ -11,6 +11,24 @@ export interface WorkerLike {
 
 export type ProcessState = 'starting' | 'running' | 'exited'
 
+/** One syscall channel: the process's main thread, or one of its threads. */
+export interface Channel {
+  page: SharedArrayBuffer
+  port: MessagePort
+  thread?: Thread
+}
+
+/** A worker_threads thread: another Worker in the same process. */
+export interface Thread {
+  id: number
+  worker?: WorkerLike
+  channel?: Channel
+  alive: boolean
+  /** Resolves with the exit code. */
+  exited: Promise<number>
+  resolve(code: number): void
+}
+
 export class Process {
   readonly pid: number
   readonly ppid: number
@@ -31,6 +49,9 @@ export class Process {
   worker?: WorkerLike
   port?: MessagePort
   page?: SharedArrayBuffer
+  execPath = ''
+  readonly threads = new Map<number, Thread>()
+  nextThreadId = 1
   private resolveExit!: (code: number) => void
 
   constructor(init: { pid: number; ppid: number; pgid?: number; argv: string[]; env: Record<string, string>; cwd: string }) {

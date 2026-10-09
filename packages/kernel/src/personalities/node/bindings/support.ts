@@ -316,68 +316,7 @@ export function supportBindings() {
       shouldNotRegisterESMLoader: false,
     }),
 
-    worker: () => ({
-      isMainThread: true,
-      isInternalThread: false,
-      ownsProcessState: true,
-      threadId: 0,
-      threadName: 'main',
-      resourceLimits: new Float64Array(4),
-      kMaxYoungGenerationSizeMb: 0,
-      kMaxOldGenerationSizeMb: 1,
-      kCodeRangeSizeMb: 2,
-      kStackSizeMb: 3,
-      kTotalResourceLimitCount: 4,
-      getEnvMessagePort: () => undefined,
-      Worker: class Worker {
-        constructor() {
-          throw new Error('worker_threads are not supported yet (webcore M1e)')
-        }
-      },
-    }),
 
-    messaging: (realm: Realm) => {
-      // Node patches MessagePort.prototype, so these must be our own classes, never the host's.
-      class MessagePort {
-        postMessage() {}
-        start() {}
-        close() {}
-        drain() {}
-        ref() {}
-        unref() {}
-        hasRef() {
-          return false
-        }
-      }
-      class MessageChannel {
-        port1 = new MessagePort()
-        port2 = new MessagePort()
-      }
-      return {
-        MessagePort,
-        MessageChannel,
-        JSTransferable: class JSTransferable {},
-        get DOMException() {
-          return realm.perContextExports.DOMException
-        },
-        exposeLazyDOMExceptionProperty: (target: object) =>
-          Object.defineProperty(target, 'DOMException', {
-            configurable: true,
-            enumerable: false,
-            get: () => realm.perContextExports.DOMException,
-            set(value) {
-              Object.defineProperty(target, 'DOMException', { value, writable: true, configurable: true, enumerable: false })
-            },
-          }),
-        structuredClone: (value: unknown, options?: StructuredSerializeOptions) => host.structuredClone(value, options),
-        stopMessagePort: () => {},
-        drainMessagePort: () => {},
-        receiveMessageOnPort: () => undefined,
-        moveMessagePortToContext: (port: MessagePort) => port,
-        setDeserializerCreateObjectFunction: () => {},
-        broadcastChannel: () => new MessagePort(),
-      }
-    },
 
     performance: (realm: Realm) => {
       const milestones = new Float64Array(8)

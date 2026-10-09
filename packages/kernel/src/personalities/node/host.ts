@@ -9,6 +9,7 @@ export const host = {
   TextDecoder: g.TextDecoder,
   URL: g.URL,
   MessageChannel: g.MessageChannel,
+  BroadcastChannel: g.BroadcastChannel,
   performance: g.performance,
   navigator: g.navigator as Navigator | undefined,
   atob: g.atob.bind(g),

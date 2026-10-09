@@ -1,5 +1,6 @@
-// WASI preview1 personality (ADR-0004). Maps wasi_snapshot_preview1 imports onto kernel syscalls.
-// Preopens follow the wasmtime convention: fd 3 is "/", fd 4 is the working directory.
+// wasi_snapshot_preview1 (ADR-0004) on kernel syscalls, shared by the WASI personality and by
+// Node's node:wasi. WASI fds are a table of their own, mapped onto the process's kernel fds, so a
+// module inside a Node process doesn't collide with Node's own open files.
 import {
   AT_FDCWD,
   O_APPEND,
@@ -11,11 +12,10 @@ import {
   O_TRUNC,
   O_WRONLY,
   SEEK_CUR,
-} from '../abi/constants.ts'
-import type { Dirent, FileType, Stat } from '../abi/constants.ts'
-import { Errno } from '../abi/errno.ts'
-import type { BootMessage } from '../abi/protocol.ts'
-import { SysError, type SyscallClient } from '../process/syscalls.ts'
+} from '../../abi/constants.ts'
+import type { Dirent, FileType, Stat } from '../../abi/constants.ts'
+import { Errno } from '../../abi/errno.ts'
+import { SysError, type SyscallClient } from '../../process/syscalls.ts'
 
 // WASI errno values.
 const SUCCESS = 0
@@ -77,27 +77,62 @@ const FDFLAG_APPEND = 1
 const CLOCK_REALTIME = 0
 const EVENTTYPE_CLOCK = 0
 
-export function runWasi(boot: BootMessage, sys: SyscallClient): never {
-  const module = boot.module
-  if (!module) throw new Error('missing Wasm module')
+export interface Preview1Options {
+  sys: SyscallClient
+  args: string[]
+  /** KEY=value strings. */
+  env: string[]
+  /** Directories the module may use: [name it sees, path in the VFS]. They become fds 3, 4, … */
+  preopens: [name: string, path: string][]
+  /** Kernel fds behind WASI fds 0, 1 and 2. */
+  stdio: [number, number, number]
+  /** Whether fd_close on 0-2 closes the kernel fds (only when the module owns the process). */
+  ownsStdio: boolean
+  memory(): WebAssembly.Memory
+  exit(code: number): never
+}
 
+export interface Preview1 {
+  imports: Record<string, (...args: never[]) => number | void>
+  /** Closes every kernel fd the module opened. */
+  close(): void
+}
+
+export function createPreview1(options: Preview1Options): Preview1 {
+  const { sys } = options
   const encoder = new TextEncoder()
   const decoder = new TextDecoder()
-  const args = boot.argv.map((arg) => encoder.encode(`${arg}\0`))
-  const environ = Object.entries(boot.env).map(([key, value]) => encoder.encode(`${key}=${value}\0`))
+  const args = options.args.map((arg) => encoder.encode(`${arg}\0`))
+  const environ = options.env.map((entry) => encoder.encode(`${entry}\0`))
 
+  /** WASI fd → kernel fd. */
+  const table = new Map<number, number>(options.stdio.map((fd, i) => [i, fd]))
   const preopens = new Map<number, Uint8Array>()
-  for (const [path, name] of [['/', '/'], ['.', '.']]) {
+  for (const [name, path] of options.preopens) {
     try {
-      preopens.set(sys.call('open', path, O_RDONLY | O_DIRECTORY, 0, AT_FDCWD), encoder.encode(name))
+      const fd = 3 + preopens.size
+      table.set(fd, sys.call('open', path, O_RDONLY | O_DIRECTORY, 0, AT_FDCWD))
+      preopens.set(fd, encoder.encode(name))
     } catch {
-      // A missing working directory just means no "." preopen.
+      // A missing directory is simply not preopened.
     }
   }
+  const kfd = (fd: number): number => {
+    const kernelFd = table.get(fd)
+    if (kernelFd === undefined) throw new SysError(Errno.EBADF, 'wasi')
+    return kernelFd
+  }
+  /** The kernel fd for a path lookup's directory fd. */
+  const dir = (fd: number) => kfd(fd)
+  const allocate = (kernelFd: number): number => {
+    let fd = 3
+    while (table.has(fd)) fd++
+    table.set(fd, kernelFd)
+    return fd
+  }
 
-  let memory: WebAssembly.Memory | undefined
-  const view = () => new DataView(memory!.buffer)
-  const bytes = () => new Uint8Array(memory!.buffer)
+  const view = () => new DataView(options.memory().buffer)
+  const bytes = () => new Uint8Array(options.memory().buffer)
   const readString = (ptr: number, len: number) => decoder.decode(bytes().slice(ptr, ptr + len))
   const directoryListings = new Map<number, Dirent[]>()
 
@@ -210,31 +245,44 @@ export function runWasi(boot: BootMessage, sys: SyscallClient): never {
     },
 
     fd_write: (fd: number, iovs: number, count: number, nwrittenPtr: number) =>
-      guard(() => view().setUint32(nwrittenPtr, sys.call('write', fd, gather(iovs, count)), true)),
+      guard(() => view().setUint32(nwrittenPtr, sys.call('write', kfd(fd), gather(iovs, count)), true)),
 
     fd_read: (fd: number, iovs: number, count: number, nreadPtr: number) =>
       guard(() => {
-        const data = sys.call('read', fd, Math.min(iovecTotal(iovs, count), sys.maxPayload))
+        const data = sys.call('read', kfd(fd), Math.min(iovecTotal(iovs, count), sys.maxPayload))
         scatter(iovs, count, data)
         view().setUint32(nreadPtr, data.length, true)
       }),
 
     fd_close: (fd: number) =>
       guard(() => {
-        sys.call('close', fd)
+        const kernelFd = kfd(fd)
+        if (fd > 2 || options.ownsStdio) sys.call('close', kernelFd)
+        table.delete(fd)
         preopens.delete(fd)
         directoryListings.delete(fd)
       }),
 
+    fd_renumber: (from: number, to: number) =>
+      guard(() => {
+        const kernelFd = kfd(from)
+        const replaced = table.get(to)
+        if (replaced !== undefined && (to > 2 || options.ownsStdio)) sys.call('close', replaced)
+        table.set(to, kernelFd)
+        table.delete(from)
+        preopens.delete(to)
+        directoryListings.delete(to)
+      }),
+
     fd_seek: (fd: number, offset: bigint, whence: number, newOffsetPtr: number) =>
-      guard(() => view().setBigUint64(newOffsetPtr, BigInt(sys.call('seek', fd, Number(offset), whence)), true)),
+      guard(() => view().setBigUint64(newOffsetPtr, BigInt(sys.call('seek', kfd(fd), Number(offset), whence)), true)),
 
     fd_tell: (fd: number, outPtr: number) =>
-      guard(() => view().setBigUint64(outPtr, BigInt(sys.call('seek', fd, 0, SEEK_CUR)), true)),
+      guard(() => view().setBigUint64(outPtr, BigInt(sys.call('seek', kfd(fd), 0, SEEK_CUR)), true)),
 
     fd_fdstat_get: (fd: number, ptr: number) =>
       guard(() => {
-        const stat = sys.call('fstat', fd)
+        const stat = sys.call('fstat', kfd(fd))
         const dv = view()
         dv.setUint8(ptr, FILETYPE[stat.type])
         dv.setUint16(ptr + 2, 0, true)
@@ -258,8 +306,8 @@ export function runWasi(boot: BootMessage, sys: SyscallClient): never {
       return SUCCESS
     },
 
-    fd_filestat_get: (fd: number, ptr: number) => guard(() => writeFilestat(ptr, sys.call('fstat', fd))),
-    fd_filestat_set_size: (fd: number, size: bigint) => guard(() => sys.call('ftruncate', fd, Number(size))),
+    fd_filestat_get: (fd: number, ptr: number) => guard(() => writeFilestat(ptr, sys.call('fstat', kfd(fd)))),
+    fd_filestat_set_size: (fd: number, size: bigint) => guard(() => sys.call('ftruncate', kfd(fd), Number(size))),
     fd_filestat_set_times: () => SUCCESS,
     fd_sync: () => SUCCESS,
     fd_datasync: () => SUCCESS,
@@ -269,11 +317,11 @@ export function runWasi(boot: BootMessage, sys: SyscallClient): never {
       guard(() => {
         let entries = directoryListings.get(fd)
         if (!entries || cookie === 0n) {
-          const self = sys.call('fstat', fd)
+          const self = sys.call('fstat', kfd(fd))
           entries = [
             { name: '.', type: 'dir', ino: self.ino },
             { name: '..', type: 'dir', ino: 0 },
-            ...sys.call('getdents', fd),
+            ...sys.call('getdents', kfd(fd)),
           ]
           directoryListings.set(fd, entries)
         }
@@ -316,34 +364,34 @@ export function runWasi(boot: BootMessage, sys: SyscallClient): never {
         if (oflags & OFLAG_EXCL) flags |= O_EXCL
         if (oflags & OFLAG_TRUNC) flags |= O_TRUNC
         if (fdflags & FDFLAG_APPEND) flags |= O_APPEND
-        const fd = sys.call('open', readString(pathPtr, pathLen), flags, 0o666, dirfd)
-        view().setUint32(fdPtr, fd, true)
+        const kernelFd = sys.call('open', readString(pathPtr, pathLen), flags, 0o666, dir(dirfd))
+        view().setUint32(fdPtr, allocate(kernelFd), true)
       }),
 
     path_filestat_get: (dirfd: number, flags: number, pathPtr: number, pathLen: number, ptr: number) =>
       guard(() => {
         const path = readString(pathPtr, pathLen)
-        writeFilestat(ptr, flags & LOOKUP_SYMLINK_FOLLOW ? sys.call('stat', path, dirfd) : sys.call('lstat', path, dirfd))
+        writeFilestat(ptr, flags & LOOKUP_SYMLINK_FOLLOW ? sys.call('stat', path, dir(dirfd)) : sys.call('lstat', path, dir(dirfd)))
       }),
     path_readlink: (dirfd: number, pathPtr: number, pathLen: number, buf: number, bufLen: number, bufusedPtr: number) =>
       guard(() => {
-        const target = encoder.encode(sys.call('readlink', readString(pathPtr, pathLen), dirfd)).subarray(0, bufLen)
+        const target = encoder.encode(sys.call('readlink', readString(pathPtr, pathLen), dir(dirfd))).subarray(0, bufLen)
         bytes().set(target, buf)
         view().setUint32(bufusedPtr, target.length, true)
       }),
     path_symlink: (targetPtr: number, targetLen: number, dirfd: number, pathPtr: number, pathLen: number) =>
-      guard(() => sys.call('symlink', readString(targetPtr, targetLen), readString(pathPtr, pathLen), dirfd)),
+      guard(() => sys.call('symlink', readString(targetPtr, targetLen), readString(pathPtr, pathLen), dir(dirfd))),
     path_link: (fromFd: number, _flags: number, fromPtr: number, fromLen: number, toFd: number, toPtr: number, toLen: number) =>
-      guard(() => sys.call('link', readString(fromPtr, fromLen), readString(toPtr, toLen), fromFd, toFd)),
+      guard(() => sys.call('link', readString(fromPtr, fromLen), readString(toPtr, toLen), dir(fromFd), dir(toFd))),
     path_filestat_set_times: () => SUCCESS,
     path_create_directory: (dirfd: number, pathPtr: number, pathLen: number) =>
-      guard(() => sys.call('mkdir', readString(pathPtr, pathLen), 0o777, dirfd)),
+      guard(() => sys.call('mkdir', readString(pathPtr, pathLen), 0o777, dir(dirfd))),
     path_unlink_file: (dirfd: number, pathPtr: number, pathLen: number) =>
-      guard(() => sys.call('unlink', readString(pathPtr, pathLen), dirfd)),
+      guard(() => sys.call('unlink', readString(pathPtr, pathLen), dir(dirfd))),
     path_remove_directory: (dirfd: number, pathPtr: number, pathLen: number) =>
-      guard(() => sys.call('rmdir', readString(pathPtr, pathLen), dirfd)),
+      guard(() => sys.call('rmdir', readString(pathPtr, pathLen), dir(dirfd))),
     path_rename: (fromFd: number, fromPtr: number, fromLen: number, toFd: number, toPtr: number, toLen: number) =>
-      guard(() => sys.call('rename', readString(fromPtr, fromLen), readString(toPtr, toLen), fromFd, toFd)),
+      guard(() => sys.call('rename', readString(fromPtr, fromLen), readString(toPtr, toLen), dir(fromFd), dir(toFd))),
 
     poll_oneoff: (inPtr: number, outPtr: number, count: number, neventsPtr: number) => {
       // Clock subscriptions sleep; fd subscriptions are reported ready immediately (M0 limitation).
@@ -374,32 +422,25 @@ export function runWasi(boot: BootMessage, sys: SyscallClient): never {
       return SUCCESS
     },
 
-    proc_exit: (code: number) => sys.exit(code),
+    proc_exit: (code: number) => options.exit(code),
     sched_yield: () => SUCCESS,
   }
 
-  const imports: WebAssembly.Imports = { wasi_snapshot_preview1: {} }
-  for (const entry of WebAssembly.Module.imports(module)) {
-    if (entry.kind !== 'function') continue
-    const namespace = (imports[entry.module] ??= {}) as Record<string, unknown>
-    namespace[entry.name] =
-      entry.module === 'wasi_snapshot_preview1' && Object.hasOwn(wasi, entry.name) ? wasi[entry.name] : () => WASI_ENOSYS
+  return {
+    imports: wasi,
+    close() {
+      for (const [fd, kernelFd] of table) {
+        if (fd > 2 || options.ownsStdio) {
+          try {
+            sys.call('close', kernelFd)
+          } catch {
+            // Already closed.
+          }
+        }
+      }
+      table.clear()
+    },
   }
-
-  const instance = new WebAssembly.Instance(module, imports)
-  memory = instance.exports.memory as WebAssembly.Memory | undefined
-  const start = instance.exports._start
-  if (!memory || typeof start !== 'function') {
-    sys.call('write', 2, encoder.encode(`${boot.argv[0]}: not a WASI command (missing memory or _start)\n`))
-    return sys.exit(126)
-  }
-
-  try {
-    ;(start as () => void)()
-  } catch (error) {
-    if (!(error instanceof WebAssembly.RuntimeError)) throw error
-    sys.call('write', 2, encoder.encode(`${boot.argv[0]}: wasm trap: ${error.message}\n`))
-    return sys.exit(134)
-  }
-  return sys.exit(0)
 }
+
+export { WASI_ENOSYS }

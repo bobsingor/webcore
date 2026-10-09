@@ -15,12 +15,16 @@ browser's own JIT. Everything else runs as WebAssembly.
 Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design and roadmap, and
 [docs/adr/](docs/adr/README.md) for the decisions behind it.
 
-## Status: M1d, npm ✅
+## Status: M1e, Vite ✅
 
 `node` is **Node.js v24.21.0**: Node's own JavaScript standard library, unmodified, running on the
 browser's JavaScript engine over bindings written against the kernel. The bindings replace the C++
 half of Node (ADR-0005, ADR-0012). Servers it starts open in a preview pane (ADR-0014), and
 `npm create vite` + `npm install` work against the real npm registry (ADR-0015).
+
+M1's exit criterion runs in the browser: `npm run dev` starts Vite 8 (with Rolldown's wasm build and
+its worker threads) in under a second, the React app renders in the preview pane, and edits update
+it in place (HMR).
 
 ```sh
 user@webcore:~$ node -p "process.version + ' on ' + process.platform"
@@ -39,6 +43,8 @@ What works:
   - virtual TCP on one loopback host: `listen`/`accept`/`connect`/`shutdown` (ADR-0014)
   - symbolic and hard links, process groups (Ctrl+C stops a whole job), and `extract`, which
     unpacks an npm tarball in one syscall (ADR-0015)
+  - threads: Workers inside a process, sharing its fds (ADR-0016)
+  - `watch`, an inotify-like fd fed by the kernel's filesystem events
 - **Syscall ABI:** Linux semantics and errno values. Sync calls block on a shared-memory page. Async
   calls go over a MessagePort, so Node's event loop keeps running.
 - **Node.js:**
@@ -53,7 +59,12 @@ What works:
   - `net`, `http` and `dns` over the kernel's sockets, between processes or within one
   - `zlib` (byte-identical to Node's) and `crypto` (digests, HMAC, PBKDF2, HKDF, random, secret
     keys, and WebCrypto digest/HMAC/PBKDF2/HKDF)
-  - 66 of 72 builtin modules load; the rest are scheduled (see [the M1 plan](docs/milestones/M1.md))
+  - `worker_threads` (messages, transfers, `SharedArrayBuffer`, `BroadcastChannel`, `terminate`)
+    and `node:wasi`, enough for wasm32-wasi N-API addons such as Rolldown (ADR-0016)
+  - `fs.watch` (also recursive), `fs.promises.watch` and `fs.watchFile`
+  - `v8.serialize` (V8's wire format, byte for byte) and `node:test`
+  - 68 of 72 builtin modules load; the rest are `repl` and the inspector modules (see
+    [the M1 plan](docs/milestones/M1.md))
 - **npm and sh** (ADR-0015): webcore's own programs, running as processes on its Node.
   - **npm:** `install`, `ci`, `uninstall`, `run`, `exec`/`npx`, `init`/`create`, with npm's
     `node_modules` layout, lockfile and `.bin` links. Native packages are swapped for their
@@ -81,8 +92,8 @@ pnpm dev
 programs first.
 
 `pnpm dev` opens the playground at http://localhost:5180: a terminal, example commands, a preview
-pane, and a live kernel event log. Try "HTTP server + preview", or "npm create vite (React)" then
-"npm install".
+pane, and a live kernel event log. Try "HTTP server + preview", or the Vite flow: "npm create vite
+(React)", "npm install", "npm run dev (Vite)", then "Edit App.jsx (HMR)" while it runs.
 
 ```bash
 pnpm test
@@ -105,7 +116,7 @@ packages/
     src/abi/             syscall surface, errno, flags, wire protocol, syscall page
     src/kernel/          Kernel, processes, VFS, pipes, open files, exec resolution, events
     src/process/         Worker entries (browser, Node) and the process-side syscall client
-    src/personalities/   wasi.ts (WASI preview1), node/ (Node.js: realm, event loop, bindings)
+    src/personalities/   wasi/ (WASI preview1), node/ (Node.js: realm, event loop, bindings)
     src/host/            ProcessHosts, exec/pipeline helpers, mini shell, root filesystem, HTTP client
     src/lib/             environment-free libraries (the HTTP/1.1 parser)
     src/preview/         preview bridge, Service Worker, client script, Vite plugin (ADR-0014)
@@ -123,6 +134,7 @@ apps/
 import { Kernel, installRootfs, exec, DEFAULT_ENV } from '@webcore/kernel'
 import { webProcessHost } from '@webcore/kernel/web' // or nodeProcessHost from '@webcore/kernel/node'
 
+// webProcessHost keeps two Workers booted for fast spawns ({ warmWorkers: n } to change it)
 const kernel = new Kernel({ host: webProcessHost(), assets: { 'node-lib': nodeLibBytes } })
 // userland: @webcore/userland's dist/userland.json (sh, npm, npx)
 installRootfs(kernel, { echo: echoWasmBytes /* … */ }, userland)
@@ -150,18 +162,22 @@ kernel.events.subscribe((event) => {
 ## Known limitations
 
 - **Networking is local only.**
-  - Global `fetch` reaches the internet (with CORS), but Node's `http`/`https` modules can't
-    (after M1e).
+  - Global `fetch` reaches the internet (with CORS), but Node's `http`/`https` modules can't yet:
+    they need TLS (after M1).
   - No Unix domain sockets, UDP or HTTP/2.
   - Previews work inside the page that runs the kernel, not in a tab of their own.
 - **crypto has no OpenSSL.** Ciphers, signatures, asymmetric keys and TLS throw. zlib has no
   Brotli or zstd.
 - **npm is webcore's own.** It skips dependencies' install scripts, and doesn't publish or do
   workspaces, `git:`/`file:` specs or global installs (ADR-0015).
-- **No `fs.watch`, `worker_threads` or Wasm native addons** (M1e).
-- **The kernel runs on the page's main thread.** It moves into an isolated iframe in M1e (ADR-0009).
-- **The VFS is in-memory and mutable**, with no symlinks. The content-addressed copy-on-write store
-  comes in M2 (ADR-0007).
+- **`worker_threads` can't receive synchronously across threads** (`Atomics.wait` +
+  `receiveMessageOnPort`), `SHARE_ENV` copies the environment, and `resourceLimits` aren't enforced
+  (ADR-0016).
+- **The kernel runs on the page's main thread**, and the page must be cross-origin isolated. It
+  moves into an isolated runtime iframe in M1f (ADR-0009).
+- **Background tabs are slow.** Browsers throttle hidden pages, and every process feels it.
+- **The VFS is in-memory and mutable.** The content-addressed copy-on-write store comes in M2
+  (ADR-0007).
 - **No TTY/PTY yet**: stdio is pipes and files (M2).
 - **The terminal's shell is host-side and minimal.** It hands `rm`, `mkdir` and similar to
   `/bin/sh`. A terminal that runs a shell process needs a PTY (M2), and coreutils arrive with

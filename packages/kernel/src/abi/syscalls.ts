@@ -102,6 +102,28 @@ export interface Syscalls {
    * Returns the number of files written; EBADMSG when the integrity check fails.
    */
   extract(archive: Uint8Array, dir: string, options?: ExtractOptions): number
+  /**
+   * Starts a thread of the calling process: a Worker that shares its fds, cwd and pid. `port`
+   * (transferred) reaches the thread in its boot message. Returns the thread id.
+   */
+  threadSpawn(request: ThreadSpawnRequest, port: MessagePort): number
+  /** Waits for a thread to end; returns its exit code. */
+  threadWait(id: number): number
+  /** Stops a thread abruptly (worker.terminate()); it ends with code 1. */
+  threadTerminate(id: number): number
+  /**
+   * Watches a file or directory (like inotify). Reading the returned fd blocks until changes arrive,
+   * as newline-separated JSON: {"event": "rename" | "change", "path": relative name}.
+   */
+  watch(path: string, recursive: boolean): number
+}
+
+export interface ThreadSpawnRequest {
+  /** The thread's id, allocated by the caller (worker_threads needs it synchronously). */
+  id?: number
+  env: Record<string, string>
+  /** Passed through to the thread's boot message. */
+  options?: Record<string, unknown>
 }
 
 export type SyscallName = keyof Syscalls

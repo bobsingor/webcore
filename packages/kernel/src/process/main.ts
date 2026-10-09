@@ -4,7 +4,7 @@
 // guest program.
 import type { BootMessage } from '../abi/protocol.ts'
 import { runNodejs } from '../personalities/node/index.ts'
-import { runWasi } from '../personalities/wasi.ts'
+import { runWasi } from '../personalities/wasi/index.ts'
 import { SyscallClient } from './syscalls.ts'
 
 /** Hooks for errors that escape the guest program, provided per environment. */

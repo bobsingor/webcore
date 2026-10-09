@@ -2,6 +2,7 @@
 import { Worker } from 'node:worker_threads'
 import type { ProcessHost } from '../kernel/kernel.ts'
 import type { WorkerLike } from '../kernel/process.ts'
+import { workerPool } from './pool.ts'
 
 const workerUrl = new URL('../process/worker-node.ts', import.meta.url)
 
@@ -11,11 +12,24 @@ const execArgv = features.typescript
   ? undefined
   : [...process.execArgv, '--experimental-strip-types', '--disable-warning=ExperimentalWarning']
 
-export function nodeProcessHost(): ProcessHost {
+export interface NodeProcessHostOptions {
+  /** Workers kept loaded and waiting for a process to boot (default 0: tests create many kernels). */
+  warmWorkers?: number
+}
+
+export function nodeProcessHost(options: NodeProcessHostOptions = {}): ProcessHost {
+  const take = workerPool(options.warmWorkers ?? 0, (onError) => {
+    const worker = new Worker(workerUrl, { execArgv })
+    worker.on('error', onError)
+    // A waiting Worker must not keep the host process alive.
+    worker.unref()
+    return worker
+  })
   return {
     createWorker(onError): WorkerLike {
-      const worker = new Worker(workerUrl, { execArgv })
-      worker.on('error', onError)
+      const { worker, claim } = take()
+      claim(onError)
+      worker.ref()
       return {
         postMessage: (message, transfer) => worker.postMessage(message, transfer as never),
         terminate: () => void worker.terminate(),

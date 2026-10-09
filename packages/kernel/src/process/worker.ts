@@ -2,24 +2,27 @@
 import type { BootMessage } from '../abi/protocol.ts'
 import { startProcess } from './main.ts'
 
-self.addEventListener(
+// Captured now: the Node realm hides browser-only globals such as `self` and `addEventListener`.
+const on = self.addEventListener.bind(self)
+
+on(
   'message',
   (event) =>
-    startProcess(event.data as BootMessage, {
+    startProcess((event as MessageEvent).data as BootMessage, {
       onUncaughtError(handler) {
-        self.addEventListener('error', (error) => {
+        on('error', (error) => {
           error.preventDefault()
           handler(error.error ?? new Error(error.message))
         })
       },
       onUnhandledRejection(handler) {
-        self.addEventListener('unhandledrejection', (event) => {
+        on('unhandledrejection', (event) => {
           event.preventDefault()
           handler(event.reason, event.promise)
         })
       },
       onRejectionHandled(handler) {
-        self.addEventListener('rejectionhandled', (event) => handler(event.promise))
+        on('rejectionhandled', (event) => handler(event.promise))
       },
     }),
   { once: true },
