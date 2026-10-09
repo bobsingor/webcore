@@ -17,18 +17,9 @@ importers:
 
   apps/playground:
     dependencies:
-      '@webcore/kernel':
+      '@webcore/sdk':
         specifier: workspace:*
-        version: link:../../packages/kernel
-      '@webcore/node-lib':
-        specifier: workspace:*
-        version: link:../../packages/node-lib
-      '@webcore/userland':
-        specifier: workspace:*
-        version: link:../../packages/userland
-      '@webcore/wat-bin':
-        specifier: workspace:*
-        version: link:../../packages/wat-bin
+        version: link:../../packages/sdk
     devDependencies:
       vite:
         specifier: ^8.3.4
@@ -54,6 +45,30 @@ importers:
         version: 5.0.3(@types/node@22.20.5)(vite@8.3.4(@types/node@22.20.5))
 
   packages/node-lib: {}
+
+  packages/runtime:
+    dependencies:
+      '@webcore/kernel':
+        specifier: workspace:*
+        version: link:../kernel
+      '@webcore/node-lib':
+        specifier: workspace:*
+        version: link:../node-lib
+      '@webcore/sdk':
+        specifier: workspace:*
+        version: link:../sdk
+      '@webcore/userland':
+        specifier: workspace:*
+        version: link:../userland
+      '@webcore/wat-bin':
+        specifier: workspace:*
+        version: link:../wat-bin
+    devDependencies:
+      vite:
+        specifier: ^8.3.4
+        version: 8.3.4(@types/node@22.20.5)
+
+  packages/sdk: {}
 
   packages/userland: {}
 

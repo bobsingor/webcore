@@ -1,0 +1,64 @@
+// The runtime page (ADR-0009, ADR-0017). It runs on its own origin, cross-origin isolated by its
+// own headers, inside an iframe that @webcore/sdk creates. The embedding page never touches the
+// kernel: it gets one MessagePort, and this page answers on it.
+import { installRootfs, Kernel, PreviewBridge } from '@webcore/kernel'
+import { webProcessHost } from '@webcore/kernel/web'
+import nodeLibUrl from '@webcore/node-lib/node-lib.bin?url'
+import { previewOrigin, PROTOCOL_VERSION, RUNTIME_HELLO, RUNTIME_LOADED } from '@webcore/sdk/protocol'
+import userland from '@webcore/userland/userland.json'
+import catUrl from '@webcore/wat-bin/cat.wasm?url'
+import echoUrl from '@webcore/wat-bin/echo.wasm?url'
+import lsUrl from '@webcore/wat-bin/ls.wasm?url'
+import wcUrl from '@webcore/wat-bin/wc.wasm?url'
+import { serveRuntime } from './server.ts'
+
+const NOT_ISOLATED =
+  "The webcore runtime isn't cross-origin isolated, so it can't use SharedArrayBuffer. Its page must be " +
+  'served with Document-Isolation-Policy (Chromium), or, in other browsers, be embedded by a page that is ' +
+  'itself cross-origin isolated (Cross-Origin-Opener-Policy: same-origin and Cross-Origin-Embedder-Policy: ' +
+  'require-corp or credentialless). See ADR-0017.'
+
+// Previews are served from p<port>.localhost on this runtime's port (ADR-0014). A deployment on
+// its own domain would use p{port}.<preview domain>.
+const PREVIEW_ORIGIN = `${location.protocol}//p{port}.localhost${location.port ? `:${location.port}` : ''}`
+
+const download = async (url: string) => new Uint8Array(await (await fetch(url)).arrayBuffer())
+const loadAssets = () =>
+  Promise.all([
+    download(nodeLibUrl),
+    Promise.all(
+      Object.entries({ cat: catUrl, echo: echoUrl, ls: lsUrl, wc: wcUrl }).map(async ([name, url]) => [name, await download(url)] as const),
+    ).then((entries) => Object.fromEntries(entries)),
+  ])
+
+async function start(port: MessagePort, assets: ReturnType<typeof loadAssets>): Promise<void> {
+  if (!crossOriginIsolated) {
+    port.postMessage({ t: 'failed', message: NOT_ISOLATED })
+    return
+  }
+  try {
+    const [nodeLib, binaries] = await assets
+    const kernel = new Kernel({ host: webProcessHost(), assets: { 'node-lib': nodeLib } })
+    installRootfs(kernel, binaries, userland)
+    const bridge = new PreviewBridge(kernel, { origin: (number) => previewOrigin(PREVIEW_ORIGIN, number) })
+    serveRuntime(kernel, port, { previewOrigin: PREVIEW_ORIGIN, previews: bridge })
+  } catch (error) {
+    port.postMessage({ t: 'failed', message: `The webcore runtime failed to start: ${error instanceof Error ? error.message : String(error)}` })
+  }
+}
+
+if (window.parent === window) {
+  document.getElementById('status')!.textContent = 'This is the webcore runtime. Pages embed it with @webcore/sdk.'
+} else {
+  // Downloads start right away, while the embedding page sets up the channel.
+  const assets = loadAssets()
+  assets.catch(() => {})
+  // One embedding page drives this runtime: the parent, once.
+  let connected = false
+  addEventListener('message', (event) => {
+    if (connected || event.source !== window.parent || event.data?.type !== RUNTIME_HELLO || !event.ports[0]) return
+    connected = true
+    void start(event.ports[0], assets)
+  })
+  window.parent.postMessage({ type: RUNTIME_LOADED, protocol: PROTOCOL_VERSION }, '*')
+}

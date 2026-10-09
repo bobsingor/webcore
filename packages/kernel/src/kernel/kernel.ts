@@ -168,6 +168,53 @@ export class Kernel {
     this.events.emit({ type: 'fs.change', op: existed ? 'write' : 'create', path: target })
   }
 
+  /** Creates a directory from outside any process; `recursive` creates missing parents too. */
+  mkdir(path: string, options: { recursive?: boolean } = {}): void {
+    const target = normalize(path)
+    if (!options.recursive) {
+      this.fs.mkdir(target)
+      this.events.emit({ type: 'fs.change', op: 'mkdir', path: target })
+      return
+    }
+    let prefix = ''
+    for (const segment of target.split('/').filter(Boolean)) {
+      prefix += `/${segment}`
+      const node = this.fs.tryLookup(prefix)
+      if (node?.kind === 'dir') continue
+      if (node) throw kerr('ENOTDIR', prefix)
+      this.fs.mkdir(prefix)
+      this.events.emit({ type: 'fs.change', op: 'mkdir', path: prefix })
+    }
+  }
+
+  /** Removes a file, link or directory from outside any process, like `rm` (`-r`, `-f`). */
+  remove(path: string, options: { recursive?: boolean; force?: boolean } = {}): void {
+    const target = normalize(path)
+    const node = this.fs.tryLookup(target, false)
+    if (!node) {
+      if (options.force) return
+      throw kerr('ENOENT', target)
+    }
+    if (node.kind !== 'dir') {
+      this.fs.unlink(target)
+      this.events.emit({ type: 'fs.change', op: 'unlink', path: target })
+      return
+    }
+    if (options.recursive) {
+      for (const entry of this.fs.readdir(node)) this.remove(`${target === '/' ? '' : target}/${entry.name}`, options)
+    }
+    this.fs.rmdir(target)
+    this.events.emit({ type: 'fs.change', op: 'rmdir', path: target })
+  }
+
+  /** Renames from outside any process. */
+  rename(from: string, to: string): void {
+    const source = normalize(from)
+    const target = normalize(to)
+    this.fs.rename(source, target)
+    this.events.emit({ type: 'fs.change', op: 'rename', path: source, to: target })
+  }
+
   getProcess(pid: number): Process | undefined {
     return this.procs.get(pid)
   }

@@ -8,7 +8,7 @@
   },
   "scripts": {
     "build": "pnpm --filter @webcore/wat-bin build && pnpm --filter @webcore/node-lib build && pnpm --filter @webcore/userland build",
-    "dev": "pnpm build && pnpm --filter @webcore/playground dev",
+    "dev": "pnpm build && pnpm --parallel --filter @webcore/runtime --filter @webcore/playground dev",
     "test": "pnpm build && pnpm --filter @webcore/kernel test",
     "typecheck": "tsc -p tsconfig.json"
   },

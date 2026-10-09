@@ -1,6 +1,6 @@
 # 0009. Runtime and previews live on their own origins
 
-- **Status:** Accepted · preview origins implemented in M1c ([0014](0014-preview-bridge.md)); the runtime iframe is scheduled for M1f
+- **Status:** Accepted · preview origins implemented in M1c ([0014](0014-preview-bridge.md)), the runtime iframe in M1f ([0017](0017-runtime-frame-and-sdk.md))
 - **Date:** 2026-10-09
 
 ## Context

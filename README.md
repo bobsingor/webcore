@@ -15,7 +15,7 @@ browser's own JIT. Everything else runs as WebAssembly.
 Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design and roadmap, and
 [docs/adr/](docs/adr/README.md) for the decisions behind it.
 
-## Status: M1e, Vite ✅
+## Status: M1f, isolated runtime ✅
 
 `node` is **Node.js v24.21.0**: Node's own JavaScript standard library, unmodified, running on the
 browser's JavaScript engine over bindings written against the kernel. The bindings replace the C++
@@ -23,8 +23,9 @@ half of Node (ADR-0005, ADR-0012). Servers it starts open in a preview pane (ADR
 `npm create vite` + `npm install` work against the real npm registry (ADR-0015).
 
 M1's exit criterion runs in the browser: `npm run dev` starts Vite 8 (with Rolldown's wasm build and
-its worker threads) in under a second, the React app renders in the preview pane, and edits update
-it in place (HMR).
+its worker threads), the React app renders in the preview pane, and edits update it in place (HMR).
+The kernel runs in an iframe on its own, cross-origin-isolated origin. Pages embed it with
+`@webcore/sdk` and need no special headers in Chromium (ADR-0009, ADR-0017).
 
 ```sh
 user@webcore:~$ node -p "process.version + ' on ' + process.platform"
@@ -74,7 +75,11 @@ What works:
   Service Worker and a bridge to the kernel. Page requests, cookies and WebSockets work (ADR-0014).
 - **WASI preview1:** args, env, preopens, files, directories, pipes, clocks, random, sleeps.
 - **Structured events:** spawn, exit, fs changes, and ports opening and closing (ADR-0010).
-- **Hosts:** browser (`@webcore/kernel/web`) and headless Node (`@webcore/kernel/node`).
+- **Isolation** (ADR-0017): the runtime frame isolates itself with Document-Isolation-Policy, and
+  the embedding page reaches it through one MessagePort, with an async API for files, processes,
+  shell sessions, events and previews.
+- **Hosts:** the runtime frame (`@webcore/runtime`, which uses `@webcore/kernel/web`) and headless
+  Node (`@webcore/kernel/node`).
 
 ## Quick start
 
@@ -91,8 +96,9 @@ pnpm dev
 `pnpm dev` builds the WASI test binaries, the Node standard library bundle and the userland
 programs first.
 
-`pnpm dev` opens the playground at http://localhost:5180: a terminal, example commands, a preview
-pane, and a live kernel event log. Try "HTTP server + preview", or the Vite flow: "npm create vite
+`pnpm dev` starts two servers: the runtime on http://webcore.localhost:5190 and the playground on
+http://localhost:5180. Open the playground: a terminal, example commands, a preview pane, and a
+live kernel event log. Try "HTTP server + preview", or the Vite flow: "npm create vite
 (React)", "npm install", "npm run dev (Vite)", then "Edit App.jsx (HMR)" while it runs.
 
 ```bash
@@ -124,39 +130,54 @@ packages/
   node-lib/              Node v24.21.0's lib/, vendored, plus the bundle builder (ADR-0012)
   userland/              webcore's own programs in TypeScript: sh, npm, npx (ADR-0015)
   wat-bin/               hand-written WASI programs (echo, cat, wc, ls), no C toolchain needed
+  sdk/                   @webcore/sdk: connect() and the protocol to the runtime frame (ADR-0017)
+  runtime/               @webcore/runtime: the runtime page, a static site with isolation headers
 apps/
-  playground/            browser demo (Vite)
+  playground/            browser demo (Vite), embedding the runtime through the SDK
 ```
 
 ## Embedding (current API)
 
+A page embeds webcore with `@webcore/sdk`. `connect()` starts the runtime in an invisible iframe and
+returns an async API (ADR-0017):
+
 ```ts
-import { Kernel, installRootfs, exec, DEFAULT_ENV } from '@webcore/kernel'
-import { webProcessHost } from '@webcore/kernel/web' // or nodeProcessHost from '@webcore/kernel/node'
+import { connect } from '@webcore/sdk'
 
-// webProcessHost keeps two Workers booted for fast spawns ({ warmWorkers: n } to change it)
-const kernel = new Kernel({ host: webProcessHost(), assets: { 'node-lib': nodeLibBytes } })
-// userland: @webcore/userland's dist/userland.json (sh, npm, npx)
-installRootfs(kernel, { echo: echoWasmBytes /* … */ }, userland)
-kernel.events.subscribe((event) => console.log(event))
+const runtime = await connect({ url: 'https://runtime.example.dev/' }) // a @webcore/runtime deployment
 
-const { code, stdout } = await exec(kernel, ['node', '-p', '6 * 7'], { env: { ...DEFAULT_ENV } })
+await runtime.fs.writeFile('/home/user/hello.js', 'console.log(6 * 7)')
+const { code, stdout } = await runtime.exec(['node', 'hello.js'])
+
+const shell = await runtime.createShell() // keeps cd and export between lines
+await shell.run('npm create vite@latest app -- --template react', { onStdout: (chunk) => term.write(chunk) })
+
+runtime.events.subscribe((event) => {
+  if (event.type === 'net.listen') iframe.src = runtime.previewUrl(event.port)
+})
 ```
 
-The page must be cross-origin isolated (`Cross-Origin-Opener-Policy: same-origin`,
-`Cross-Origin-Embedder-Policy: require-corp`). See ADR-0002 and ADR-0009.
+The runtime (`@webcore/runtime`, built with `vite build`) is a static site. Its host must send
+these headers on every response:
+- `Document-Isolation-Policy: isolate-and-require-corp`
+- `Cross-Origin-Embedder-Policy: require-corp`
+- `Cross-Origin-Resource-Policy: cross-origin`
 
-Previews (ADR-0014) need the `webcorePreview()` Vite plugin from `@webcore/kernel/vite` (or the same
-three files and a boot-page fallback on `p<port>.*` hosts), and a bridge on the page:
+Previews are served from `p<port>.<runtime host>`. Every page request there gets the boot page
+(ADR-0014). In browsers without Document-Isolation-Policy, the embedding page must be cross-origin
+isolated itself (`Cross-Origin-Opener-Policy: same-origin`, and `Cross-Origin-Embedder-Policy:
+require-corp` or `credentialless`).
+
+Headless, the kernel is used directly:
 
 ```ts
-import { PreviewBridge } from '@webcore/kernel'
+import { Kernel, installRootfs, exec, DEFAULT_ENV } from '@webcore/kernel'
+import { nodeProcessHost } from '@webcore/kernel/node'
 
-const bridge = new PreviewBridge(kernel) // previews on p<port>.localhost:<this page's port>
-bridge.listen()
-kernel.events.subscribe((event) => {
-  if (event.type === 'net.listen') iframe.src = bridge.url(event.port)
-})
+const kernel = new Kernel({ host: nodeProcessHost(), assets: { 'node-lib': nodeLibBytes } })
+// userland: @webcore/userland's dist/userland.json (sh, npm, npx)
+installRootfs(kernel, { echo: echoWasmBytes /* … */ }, userland)
+const { code, stdout } = await exec(kernel, ['node', '-p', '6 * 7'], { env: { ...DEFAULT_ENV } })
 ```
 
 ## Known limitations
@@ -165,7 +186,7 @@ kernel.events.subscribe((event) => {
   - Global `fetch` reaches the internet (with CORS), but Node's `http`/`https` modules can't yet:
     they need TLS (after M1).
   - No Unix domain sockets, UDP or HTTP/2.
-  - Previews work inside the page that runs the kernel, not in a tab of their own.
+  - Previews work in frames of the embedding page, not in a tab of their own.
 - **crypto has no OpenSSL.** Ciphers, signatures, asymmetric keys and TLS throw. zlib has no
   Brotli or zstd.
 - **npm is webcore's own.** It skips dependencies' install scripts, and doesn't publish or do
@@ -173,8 +194,10 @@ kernel.events.subscribe((event) => {
 - **`worker_threads` can't receive synchronously across threads** (`Atomics.wait` +
   `receiveMessageOnPort`), `SHARE_ENV` copies the environment, and `resourceLimits` aren't enforced
   (ADR-0016).
-- **The kernel runs on the page's main thread**, and the page must be cross-origin isolated. It
-  moves into an isolated runtime iframe in M1f (ADR-0009).
+- **Embedding without headers needs Chromium.** Firefox and Safari don't have
+  Document-Isolation-Policy yet, so there the embedding page must be cross-origin isolated
+  (ADR-0017). They haven't been tested.
+- **There is no hosted runtime yet.** `connect()` needs the URL of a `@webcore/runtime` deployment.
 - **Background tabs are slow.** Browsers throttle hidden pages, and every process feels it.
 - **The VFS is in-memory and mutable.** The content-addressed copy-on-write store comes in M2
   (ADR-0007).

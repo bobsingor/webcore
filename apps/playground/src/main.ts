@@ -1,21 +1,9 @@
-import {
-  createShell,
-  DEFAULT_ENV,
-  installRootfs,
-  Kernel,
-  PreviewBridge,
-  previewPortOf,
-  runLine,
-  type KernelEvent,
-} from '@webcore/kernel'
-import { webProcessHost } from '@webcore/kernel/web'
-import nodeLibUrl from '@webcore/node-lib/node-lib.bin?url'
-import userland from '@webcore/userland/userland.json'
-import catUrl from '@webcore/wat-bin/cat.wasm?url'
-import echoUrl from '@webcore/wat-bin/echo.wasm?url'
-import lsUrl from '@webcore/wat-bin/ls.wasm?url'
-import wcUrl from '@webcore/wat-bin/wc.wasm?url'
+import { connect, type Runtime, type RuntimeEvent, type ShellSession } from '@webcore/sdk'
 import './style.css'
+
+// The runtime runs on its own origin (ADR-0009, ADR-0017): @webcore/runtime's dev server, unless
+// VITE_WEBCORE_RUNTIME points elsewhere.
+const RUNTIME_URL = import.meta.env.VITE_WEBCORE_RUNTIME ?? `${location.protocol}//webcore.localhost:5190/`
 
 // The "HTTP server" example: a page plus a JSON endpoint it polls.
 const SERVER_JS = `const http = require('node:http')
@@ -67,24 +55,24 @@ http
 interface Example {
   label: string
   command: string
-  /** Host-side setup before the command runs. */
-  prepare?: (kernel: Kernel) => Promise<void>
-  /** Instead of a command: a host-side action that also works while a command runs. */
-  action?: (kernel: Kernel) => string
+  /** Setup before the command runs. */
+  prepare?: (runtime: Runtime) => Promise<void>
+  /** Instead of a command: an action that also works while a command runs. */
+  action?: (runtime: Runtime) => Promise<string>
 }
 
 const APP_JSX = '/home/user/my-app/src/App.jsx'
 
-/** What an editor does: rewrites a file through the kernel, which tells its watchers. */
-function editApp(kernel: Kernel): string {
+/** What an editor does: rewrites a file through the runtime, which tells its watchers. */
+async function editApp(runtime: Runtime): Promise<string> {
   let source: string
   try {
-    source = new TextDecoder().decode(kernel.fs.readFile(APP_JSX))
+    source = await runtime.fs.readFile(APP_JSX, 'utf8')
   } catch {
     return `${APP_JSX} doesn't exist yet: run "npm create vite (React)" first.\n`
   }
   const heading = `Edited at ${new Date().toLocaleTimeString()}`
-  kernel.writeFile(APP_JSX, source.replace(/<h1>[^<]*<\/h1>/, `<h1>${heading}</h1>`))
+  await runtime.fs.writeFile(APP_JSX, source.replace(/<h1>[^<]*<\/h1>/, `<h1>${heading}</h1>`))
   return `Wrote "${heading}" into ${APP_JSX}. With "npm run dev" running, the preview updates in place (HMR).\n`
 }
 
@@ -118,9 +106,7 @@ const EXAMPLES: Example[] = [
   {
     label: 'HTTP server + preview',
     command: 'node server.js',
-    prepare: async (kernel) => {
-      kernel.fs.writeFile('/home/user/server.js', SERVER_JS)
-    },
+    prepare: (runtime) => runtime.fs.writeFile('/home/user/server.js', SERVER_JS),
   },
   {
     label: 'ES modules',
@@ -163,7 +149,7 @@ const addressPort = $<HTMLSpanElement>('address-port')
 const addressPath = $<HTMLInputElement>('address-path')
 const frame = $<HTMLIFrameElement>('frame')
 
-const shell = createShell({ cwd: '/home/user', env: { ...DEFAULT_ENV, PWD: '/home/user' } })
+let session: ShellSession | undefined
 const history: string[] = []
 let historyIndex = 0
 let running: AbortController | undefined
@@ -177,8 +163,9 @@ function print(text: string, className = 'out'): void {
 }
 
 function renderPrompt(): void {
-  const home = shell.env.HOME ?? ''
-  const cwd = home && shell.cwd.startsWith(home) ? `~${shell.cwd.slice(home.length)}` : shell.cwd
+  const home = session?.env.HOME ?? ''
+  const where = session?.cwd ?? '/home/user'
+  const cwd = home && where.startsWith(home) ? `~${where.slice(home.length)}` : where
   ps1.textContent = `user@webcore:${cwd}$`
 }
 
@@ -187,7 +174,7 @@ function setStatus(text: string, state: 'booting' | 'ready' | 'busy' | 'error'):
   status.dataset.state = state
 }
 
-function describeEvent(event: KernelEvent): string {
+function describeEvent(event: RuntimeEvent): string {
   switch (event.type) {
     case 'process.spawn':
       return `spawn  pid ${event.pid}  ${event.argv.join(' ').slice(0, 60)}`
@@ -202,7 +189,7 @@ function describeEvent(event: KernelEvent): string {
   }
 }
 
-function logEvent(event: KernelEvent): void {
+function logEvent(event: RuntimeEvent): void {
   eventTotal++
   eventCount.textContent = String(eventTotal)
   const item = document.createElement('li')
@@ -213,12 +200,10 @@ function logEvent(event: KernelEvent): void {
 }
 
 /**
- * The preview pane: one tab per listening port, showing the port through the PreviewBridge
- * (ADR-0014). Opens on the first port that starts listening.
+ * The preview pane: one tab per listening port, showing the port through the runtime's preview
+ * bridge (ADR-0014). Opens on the first port that starts listening.
  */
-function setupPreview(kernel: Kernel): void {
-  const bridge = new PreviewBridge(kernel)
-  bridge.listen()
+function setupPreview(runtime: Runtime): void {
   const tabs = new Map<number, HTMLButtonElement>()
   let current: number | undefined
 
@@ -229,10 +214,10 @@ function setupPreview(kernel: Kernel): void {
     addressPort.textContent = `localhost:${port}`
     addressPath.value = path
     for (const [tabPort, tab] of tabs) tab.setAttribute('aria-selected', String(tabPort === port))
-    frame.src = bridge.url(port, path)
+    frame.src = runtime.previewUrl(port, path)
   }
 
-  kernel.events.subscribe((event) => {
+  runtime.events.subscribe((event) => {
     if (event.type === 'net.listen') {
       let tab = tabs.get(event.port)
       if (!tab) {
@@ -254,8 +239,8 @@ function setupPreview(kernel: Kernel): void {
   // The preview's client script reports navigations inside the frame.
   window.addEventListener('message', (event) => {
     if (event.data?.type !== 'webcore:location' || event.source !== frame.contentWindow) return
-    const port = previewPortOf(new URL(event.origin).hostname)
-    if (port === undefined || port !== current || bridge.origin(port) !== event.origin) return
+    const port = runtime.previewPortOf(event.origin)
+    if (port === undefined || port !== current) return
     const url = new URL(event.data.href)
     addressPath.value = url.pathname + url.search + url.hash
   })
@@ -269,7 +254,7 @@ function setupPreview(kernel: Kernel): void {
   })
 }
 
-async function run(kernel: Kernel, line: string, echo = true): Promise<number> {
+async function run(line: string, echo = true): Promise<number> {
   if (echo) print(`${ps1.textContent} ${line}\n`, 'cmd')
   if (line.trim() === 'clear') {
     output.replaceChildren()
@@ -285,7 +270,7 @@ async function run(kernel: Kernel, line: string, echo = true): Promise<number> {
   input.disabled = true
   setStatus('running…', 'busy')
   const started = performance.now()
-  const code = await runLine(kernel, shell, line, {
+  const code = await session!.run(line, {
     signal: running.signal,
     onStdout: (chunk) => print(decoders.out.decode(chunk, { stream: true })),
     onStderr: (chunk) => print(decoders.err.decode(chunk, { stream: true }), 'err'),
@@ -296,30 +281,25 @@ async function run(kernel: Kernel, line: string, echo = true): Promise<number> {
   input.disabled = false
   input.focus()
   renderPrompt()
-  setStatus('ready · cross-origin isolated', 'ready')
+  setStatus(READY, 'ready')
   return code
 }
 
+const READY = `ready · runtime on ${new URL(RUNTIME_URL).host}`
+
 async function boot(): Promise<void> {
-  let kernel: Kernel
+  setStatus('starting runtime…', 'booting')
+  let runtime: Runtime
   try {
-    kernel = new Kernel({ host: webProcessHost() })
+    runtime = await connect({ url: RUNTIME_URL })
+    session = await runtime.createShell()
   } catch (error) {
-    setStatus('not cross-origin isolated', 'error')
-    print(`${(error as Error).message}\n`, 'err')
+    setStatus('runtime unavailable', 'error')
+    print(`Could not start the webcore runtime at ${RUNTIME_URL}: ${(error as Error).message}\n`, 'err')
     return
   }
-  const download = async (url: string) => new Uint8Array(await (await fetch(url)).arrayBuffer())
-  const urls = { cat: catUrl, echo: echoUrl, ls: lsUrl, wc: wcUrl }
-  const [nodeLib, binaries] = await Promise.all([
-    download(nodeLibUrl),
-    Promise.all(Object.entries(urls).map(async ([name, url]) => [name, await download(url)])).then(Object.fromEntries),
-  ])
-  // Node's standard library, shared with every Node process (ADR-0012).
-  kernel.addAsset('node-lib', nodeLib)
-  installRootfs(kernel, binaries, userland)
-  kernel.events.subscribe(logEvent)
-  setupPreview(kernel)
+  runtime.events.subscribe(logEvent)
+  setupPreview(runtime)
 
   const examples = $<HTMLDivElement>('examples')
   for (const example of EXAMPLES) {
@@ -327,11 +307,11 @@ async function boot(): Promise<void> {
     button.title = example.command || example.label
     button.addEventListener('click', async () => {
       if (example.action) {
-        print(example.action(kernel), 'meta')
+        print(await example.action(runtime), 'meta')
         return
       }
       if (running) return
-      await example.prepare?.(kernel)
+      await example.prepare?.(runtime)
       input.value = example.command
       void submit()
     })
@@ -345,7 +325,7 @@ async function boot(): Promise<void> {
       history.push(line)
       historyIndex = history.length
     }
-    await run(kernel, line)
+    await run(line)
   }
 
   $<HTMLFormElement>('prompt').addEventListener('submit', (event) => {
@@ -367,10 +347,10 @@ async function boot(): Promise<void> {
   })
 
   // Exposed for debugging from the console.
-  Object.assign(globalThis, { webcore: { kernel, shell, run: (line: string) => run(kernel, line) } })
+  Object.assign(globalThis, { webcore: { runtime, session, run } })
 
   renderPrompt()
-  await run(kernel, 'cat /etc/motd', false)
+  await run('cat /etc/motd', false)
 }
 
 void boot()

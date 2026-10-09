@@ -1,0 +1,25 @@
+{
+  "name": "@webcore/runtime",
+  "version": "0.0.0",
+  "private": true,
+  "description": "The webcore runtime page: the kernel, on its own cross-origin-isolated origin, embedded by pages through @webcore/sdk.",
+  "type": "module",
+  "exports": {
+    "./server": "./src/server.ts"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@webcore/kernel": "workspace:*",
+    "@webcore/node-lib": "workspace:*",
+    "@webcore/sdk": "workspace:*",
+    "@webcore/userland": "workspace:*",
+    "@webcore/wat-bin": "workspace:*"
+  },
+  "devDependencies": {
+    "vite": "^8.3.4"
+  }
+}

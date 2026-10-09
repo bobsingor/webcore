@@ -9,10 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@webcore/kernel": "workspace:*",
-    "@webcore/node-lib": "workspace:*",
-    "@webcore/userland": "workspace:*",
-    "@webcore/wat-bin": "workspace:*"
+    "@webcore/sdk": "workspace:*"
   },
   "devDependencies": {
     "vite": "^8.3.4"

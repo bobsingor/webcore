@@ -1,0 +1,11 @@
+{
+  "name": "@webcore/sdk",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Embeds webcore in a page: starts the runtime in an isolated iframe on its own origin and talks to it over a MessagePort.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./protocol": "./src/protocol.ts"
+  }
+}

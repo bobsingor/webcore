@@ -90,20 +90,28 @@ export class PreviewBridge {
       }
       // Only our own preview origins may talk to the kernel.
       if (port === undefined || this.origin(port) !== event.origin) return
-      this.serve(event.ports[0])
+      this.serve(event.ports[0], port)
     }
     target.addEventListener('message', onMessage as EventListener)
     return () => target.removeEventListener('message', onMessage as EventListener)
   }
 
-  /** Answers requests arriving on `channel`. */
-  serve(channel: MessagePortLike): void {
+  /**
+   * Answers requests arriving on `channel`. A channel from a preview page can fetch only from the
+   * port that page previews, as a browser keeps origins apart. WebSockets may connect to any port,
+   * as in a browser; servers see the page's Origin.
+   */
+  serve(channel: MessagePortLike, port?: number): void {
     const requests = new Map<number, AbortController>()
     const sockets = new Map<number, KernelWebSocket>()
     channel.addEventListener('message', (event) => {
       const message = event.data as PreviewRequest
       switch (message?.type) {
         case 'fetch':
+          if (port !== undefined && message.port !== port) {
+            channel.postMessage({ type: 'error', id: message.id, message: `This preview can't fetch from port ${message.port}` } satisfies PreviewReply)
+            break
+          }
           void this.fetch(channel, message, requests)
           break
         case 'abort':

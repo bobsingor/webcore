@@ -13,7 +13,7 @@ const ASSETS = {
   '/__webcore/boot.html': ['boot.html', 'text/html'],
 }
 
-// Preview documents are embedded by a cross-origin-isolated page.
+// Preview documents may be embedded by a cross-origin-isolated page (ADR-0017).
 const HEADERS = {
   'Cross-Origin-Embedder-Policy': 'credentialless',
   'Cross-Origin-Resource-Policy': 'cross-origin',
